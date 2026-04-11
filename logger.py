@@ -159,13 +159,62 @@ def poll_channel(
     return len(all_messages)
 
 
+def _read_timestamp(path: Path) -> Optional[float]:
+    """Read a Unix timestamp from a state file."""
+    try:
+        return float(path.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _write_timestamp(path: Path, ts: float) -> None:
+    path.write_text(str(ts))
+
+
+IDLE_THRESHOLD = 1800  # 30 min with no messages → switch to backoff
+BACKOFF_INTERVAL = 1800  # skip polls for 30 min during idle
+
+
 def run_once(config: dict) -> int:
-    """Poll all channels once. Returns total new messages."""
+    """Poll all channels once. Returns total new messages.
+
+    Implements adaptive backoff: if no messages for IDLE_THRESHOLD seconds,
+    sets a next-poll timestamp BACKOFF_INTERVAL seconds in the future.
+    Cron invocations that land before that timestamp are skipped.
+    Any new messages reset to normal polling immediately.
+    """
+    state_dir = config["state_dir"]
+    next_poll_file = state_dir / "next_poll.txt"
+    activity_file = state_dir / "last_activity.txt"
+
+    # Check if we're in backoff — skip if next poll is in the future
+    next_poll = _read_timestamp(next_poll_file)
+    now = time.time()
+    if next_poll and now < next_poll:
+        log.info("Idle backoff — next poll in %ds, skipping", int(next_poll - now))
+        return 0
+
     total = 0
     for channel_id in config["channel_ids"]:
         total += poll_channel(
             config["token"], channel_id, config["log_dir"], config["state_dir"]
         )
+
+    if total > 0:
+        # Activity detected — reset to normal polling
+        _write_timestamp(activity_file, now)
+        next_poll_file.unlink(missing_ok=True)
+    else:
+        # No messages — check if idle long enough to backoff
+        last_activity = _read_timestamp(activity_file)
+        if last_activity is None:
+            # First run or missing file — seed it
+            _write_timestamp(activity_file, now)
+        elif now - last_activity >= IDLE_THRESHOLD:
+            _write_timestamp(next_poll_file, now + BACKOFF_INTERVAL)
+            log.info("No activity for %dm — backing off for %dm",
+                     int((now - last_activity) / 60), BACKOFF_INTERVAL // 60)
+
     return total
 
 
