@@ -54,3 +54,10 @@ One JSON object per line in `logs/<channel_id>.jsonl`:
 ## License
 
 MIT
+
+## discord-logger Architectural Debt (Todo)
+- **Rate Limiting:** Needs implementation of X-RateLimit-Reset-After header handling rather than fixed sleep.
+- **State Persistence:** Move from per-channel  files to a single SQLite database to prevent corruption and handle atomic commits.
+- **Blocking IO:** Migrate to async or concurrent execution to prevent one hanging channel from blocking the whole poll cycle.
+- **Message Lifecycle:** Implement Gateway listeners to handle  and  events which REST polling misses.
+- **Log Rotation:** Structure history logs (e.g., date-based rotation) to prevent monolithic file performance degradation.
