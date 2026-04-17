@@ -1,4 +1,4 @@
-// discord-logger UI — single-file vanilla JS
+// discord-logger UI — vanilla JS, responsive
 // All user-controlled data is escaped via esc() before HTML interpolation.
 
 const state = {
@@ -7,28 +7,24 @@ const state = {
   channels: [],
   modalMsg: null,
   modalTab: 'redact',
+  lastMessages: [],
+  sidebarOpen: false,
 };
 
 const $ = sel => document.querySelector(sel);
 const $$ = sel => document.querySelectorAll(sel);
 
+// ---------- utility ----------
 async function api(path, opts = {}) {
   const resp = await fetch(path, opts);
-  if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+  if (!resp.ok) {
+    let body = '';
+    try { body = await resp.text(); } catch(e) {}
+    throw new Error(`${resp.status}: ${body}`);
+  }
   return resp.json();
 }
 
-function fmtTs(ts) {
-  if (!ts) return '';
-  const d = new Date(ts);
-  if (isNaN(d)) return ts.slice(0, 19);
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
-
-// Escape for safe HTML interpolation — all user data passes through this.
 function esc(s) {
   const div = document.createElement('div');
   div.textContent = s == null ? '' : String(s);
@@ -37,33 +33,195 @@ function esc(s) {
 
 function setHtml(el, html) { el.innerHTML = html; }
 
-function renderMessage(msg) {
-  const edited = msg._edited ? '<span class="edited-marker"> (edited)</span>' : '';
+function toast(msg, kind) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast visible' + (kind ? ' ' + kind : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('visible'), 2400);
+}
+
+// ---------- timestamp formatting ----------
+function parseTs(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return isNaN(d) ? null : d;
+}
+
+function fmtTime(d) {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtRelativeOrShort(d) {
+  const now = new Date();
+  const diff = (now - d) / 1000;
+  const sameDay = d.toDateString() === now.toDateString();
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  const isYesterday = d.toDateString() === yesterday.toDateString();
+
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (sameDay) return `today at ${fmtTime(d)}`;
+  if (isYesterday) return `yesterday at ${fmtTime(d)}`;
+  if (diff < 7 * 86400) {
+    return d.toLocaleDateString([], { weekday: 'short' }) + ' at ' + fmtTime(d);
+  }
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined }) + ' at ' + fmtTime(d);
+}
+
+function fmtDayHeader(d) {
+  const now = new Date();
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === now.toDateString()) return 'Today';
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([], {
+    weekday: 'long', month: 'long', day: 'numeric',
+    year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined,
+  });
+}
+
+// ---------- rendering ----------
+
+// Deterministic author color from their name.
+function authorColor(name) {
+  if (!name) return 'var(--text)';
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue}, 65%, 70%)`;
+}
+
+function renderAttachments(msg) {
+  if (!msg.attachments || !msg.attachments.length) return '';
+  const items = msg.attachments.map(a => esc(a.filename || 'file')).join(', ');
+  const n = msg.attachments.length;
+  return `<div class="attachments">📎 ${n} attachment${n > 1 ? 's' : ''}: ${items}</div>`;
+}
+
+function renderNotes(msg) {
+  if (!msg._notes || !msg._notes.length) return '';
+  const lines = msg._notes.map(n =>
+    `<div class="note-line"><span>📝</span><span>${esc(n)}</span></div>`
+  ).join('');
+  return `<div class="notes">${lines}</div>`;
+}
+
+function renderMsgLine(msg, opts = {}) {
+  const edited = msg._edited ? '<span class="edited-marker">(edited)</span>' : '';
   const deleted = msg._deleted ? ' deleted' : '';
-  const att = msg.attachments && msg.attachments.length
-    ? `<div class="attachments">+${msg.attachments.length} attachment${msg.attachments.length > 1 ? 's' : ''}: ${msg.attachments.map(a => esc(a.filename || '')).join(', ')}</div>`
-    : '';
-  const notes = msg._notes && msg._notes.length
-    ? `<div class="notes">${msg._notes.map(n => `📝 ${esc(n)}`).join('<br>')}</div>`
-    : '';
+  const d = parseTs(msg.timestamp);
+  const tsShort = d ? fmtTime(d) : '';
   return `
-    <div class="message${deleted}" data-id="${esc(msg.id)}">
-      <div class="head">
-        <span class="author">${esc(msg.author_name || 'unknown')}</span>
-        <span class="ts">${esc(fmtTs(msg.timestamp))}${edited}</span>
-      </div>
-      <div class="content">${esc(msg.content || '')}</div>
-      ${att}
-      ${notes}
-      <div class="actions">
-        <button data-action="edit">Edit</button>
+    <div class="msg-line${deleted}" data-id="${esc(msg.id)}">
+      <span class="msg-line-ts">${esc(tsShort)}</span>
+      <span class="content">${esc(msg.content || (msg._deleted ? '[deleted]' : ''))}</span>
+      ${edited}
+      ${renderAttachments(msg)}
+      ${renderNotes(msg)}
+      <div class="line-actions">
+        <button data-action="edit" aria-label="Edit message">Edit</button>
       </div>
     </div>
   `;
 }
 
+// Group consecutive messages from same author within 5 min into one block.
+function renderChatFeed(messages) {
+  if (!messages.length) {
+    return '<div class="empty-state">No messages in this channel.</div>';
+  }
+  // messages are newest-first from API — reverse for chronological
+  const ordered = messages.slice().reverse();
+
+  const chunks = [];
+  let lastDayKey = null;
+  let currentGroup = null;
+
+  for (const msg of ordered) {
+    const d = parseTs(msg.timestamp);
+    const dayKey = d ? d.toDateString() : 'unknown';
+    if (dayKey !== lastDayKey) {
+      if (currentGroup) chunks.push(renderGroup(currentGroup));
+      chunks.push(`<div class="day-divider">${esc(d ? fmtDayHeader(d) : 'Unknown date')}</div>`);
+      lastDayKey = dayKey;
+      currentGroup = null;
+    }
+    const canContinue = currentGroup
+      && currentGroup.author === msg.author_name
+      && d && currentGroup.lastTs
+      && (d - currentGroup.lastTs) < 5 * 60 * 1000;
+
+    if (canContinue) {
+      currentGroup.messages.push(msg);
+      currentGroup.lastTs = d;
+    } else {
+      if (currentGroup) chunks.push(renderGroup(currentGroup));
+      currentGroup = {
+        author: msg.author_name,
+        firstTs: d,
+        lastTs: d,
+        messages: [msg],
+      };
+    }
+  }
+  if (currentGroup) chunks.push(renderGroup(currentGroup));
+  return chunks.join('');
+}
+
+function renderGroup(g) {
+  const color = authorColor(g.author);
+  const tsText = g.firstTs ? fmtRelativeOrShort(g.firstTs) : '';
+  const lines = g.messages.map(m => renderMsgLine(m)).join('');
+  return `
+    <div class="msg-group">
+      <div class="msg-group-header">
+        <span class="author" style="color: ${color}">${esc(g.author || 'unknown')}</span>
+        <span class="ts">${esc(tsText)}</span>
+      </div>
+      <div class="msg-body">${lines}</div>
+    </div>
+  `;
+}
+
+function renderSearchResult(m) {
+  const chName = (state.channels.find(c => c.id === m.channel_id) || {}).name || m.channel_id;
+  const color = authorColor(m.author_name);
+  const d = parseTs(m.timestamp);
+  const tsText = d ? fmtRelativeOrShort(d) : '';
+  return `
+    <div class="msg-group">
+      <div class="msg-group-header">
+        <span class="author" style="color: ${color}">${esc(m.author_name || 'unknown')}</span>
+        <span class="ts">${esc(tsText)}</span>
+        <span class="channel-tag">${esc(chName)}</span>
+      </div>
+      <div class="msg-body">${renderMsgLine(m)}</div>
+    </div>
+  `;
+}
+
+function renderSkeleton() {
+  let s = '';
+  for (let i = 0; i < 5; i++) {
+    s += `
+      <div class="skeleton-msg">
+        <div class="skeleton-line short"></div>
+        <div class="skeleton-line long"></div>
+        <div class="skeleton-line med"></div>
+      </div>
+    `;
+  }
+  return s;
+}
+
+// ---------- loaders ----------
 async function loadChannels() {
-  state.channels = await api('/api/channels');
+  try {
+    state.channels = await api('/api/channels');
+  } catch (e) {
+    setHtml($('#channelList'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+    return;
+  }
   const html = state.channels.map(c => `
     <div class="channel ${c.id === state.channelId ? 'active' : ''}" data-id="${esc(c.id)}">
       <span class="name">${esc(c.name)}</span>
@@ -78,29 +236,37 @@ async function loadChannels() {
       state.view = 'chat';
       setView('chat');
       $$('.channel').forEach(c => c.classList.toggle('active', c.dataset.id === state.channelId));
+      updateCurrentChannelLabel();
+      closeSidebar();
       loadChat();
     });
   });
 }
 
-async function loadChat() {
+function updateCurrentChannelLabel() {
+  const el = $('#currentChannel');
   if (!state.channelId) {
-    $('#content').className = 'content empty';
-    setHtml($('#content'), '<div>Select a channel to view messages</div>');
+    el.classList.remove('visible');
+    el.textContent = '';
     return;
   }
-  $('#content').className = 'content';
-  setHtml($('#content'), '<div class="empty-state">Loading...</div>');
+  const c = state.channels.find(x => x.id === state.channelId);
+  el.textContent = c ? c.name : state.channelId;
+  el.classList.add('visible');
+}
+
+async function loadChat() {
+  if (!state.channelId) {
+    setHtml($('#content'), '<div class="empty-state">Select a channel to view messages</div>');
+    return;
+  }
+  setHtml($('#content'), renderSkeleton());
   try {
     const messages = await api(`/api/messages/${encodeURIComponent(state.channelId)}?limit=300`);
-    if (!messages.length) {
-      setHtml($('#content'), '<div class="empty-state">No messages in this channel.</div>');
-      return;
-    }
-    const rendered = messages.slice().reverse().map(renderMessage).join('');
-    setHtml($('#content'), rendered);
+    state.lastMessages = messages;
+    setHtml($('#content'), renderChatFeed(messages));
     attachMessageHandlers();
-    $('#content').scrollTop = $('#content').scrollHeight;
+    scrollToBottom(false);
   } catch (e) {
     setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
   }
@@ -111,10 +277,10 @@ async function runSearch() {
   const author = $('#searchAuthor').value.trim();
   const deleted = $('#searchDeleted').checked;
   if (!q && !author) {
-    setHtml($('#content'), '<div class="empty-state">Enter a pattern or author name.</div>');
+    setHtml($('#content'), '<div class="empty-state">Enter a pattern or author name above.</div>');
     return;
   }
-  setHtml($('#content'), '<div class="empty-state">Searching...</div>');
+  setHtml($('#content'), renderSkeleton());
   try {
     const params = new URLSearchParams({ limit: 200 });
     if (q) params.set('q', q);
@@ -130,22 +296,16 @@ async function runSearch() {
       setHtml($('#content'), '<div class="empty-state">No matches.</div>');
       return;
     }
-    const html = res.map(m => {
-      const chName = (state.channels.find(c => c.id === m.channel_id) || {}).name || m.channel_id;
-      return `<div style="margin-bottom: 12px;">
-        <div style="color: var(--text-faint); font-size: 12px; margin-bottom: 2px;">${esc(chName)}</div>
-        ${renderMessage(m)}
-      </div>`;
-    }).join('');
-    setHtml($('#content'), html);
+    setHtml($('#content'), res.map(renderSearchResult).join(''));
     attachMessageHandlers();
+    $('#main').scrollTop = 0;
   } catch (e) {
     setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
   }
 }
 
 async function loadEditLog() {
-  setHtml($('#content'), '<div class="empty-state">Loading...</div>');
+  setHtml($('#content'), renderSkeleton());
   try {
     const edits = await api('/api/edits');
     if (!edits.length) {
@@ -153,79 +313,117 @@ async function loadEditLog() {
       return;
     }
     edits.reverse();
-    const html = edits.map(e => {
+    setHtml($('#content'), edits.map(e => {
       const detail = e.action === 'note' || e.action === 'redact'
-        ? ` — ${esc(e.content || e.value || '')}`
+        ? `<div class="detail">${esc(e.content || e.value || '')}</div>`
         : e.action === 'update'
-          ? ` — ${esc(e.field)}=${esc(e.value || '')}`
+          ? `<div class="detail"><strong>${esc(e.field)}</strong> → ${esc(e.value || '')}</div>`
           : '';
       return `<div class="edit-log-entry">
-        <span style="color: var(--text-faint);">${esc(e.ts)}</span>
         <span class="action-tag action-${esc(e.action)}">${esc(e.action)}</span>
-        <span>${esc(e.msg_id)}</span>${detail}
+        <span class="ts">${esc(e.ts)}</span>
+        <span class="msg-id">#${esc(e.msg_id)}</span>
+        ${detail}
       </div>`;
-    }).join('');
-    setHtml($('#content'), html);
+    }).join(''));
   } catch (e) {
     setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
   }
 }
 
+// ---------- view switching ----------
 function setView(view) {
   state.view = view;
-  $$('header nav button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-  $('#searchToolbar').style.display = view === 'search' ? 'flex' : 'none';
+  $$('.view-tabs button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  $('#searchBar').style.display = view === 'search' ? 'flex' : 'none';
   if (view === 'chat') loadChat();
   else if (view === 'search') {
     if ($('#searchQ').value || $('#searchAuthor').value) runSearch();
-    else setHtml($('#content'), '<div class="empty-state">Enter a pattern and hit Go.</div>');
+    else setHtml($('#content'), '<div class="empty-state">Enter a pattern and hit Search.</div>');
+    setTimeout(() => $('#searchQ').focus(), 50);
   }
   else if (view === 'editlog') loadEditLog();
 }
 
+function refreshCurrent() {
+  if (state.view === 'chat') loadChat();
+  else if (state.view === 'search') runSearch();
+  else if (state.view === 'editlog') loadEditLog();
+  loadChannels();
+}
+
+// ---------- sidebar ----------
+function openSidebar() {
+  state.sidebarOpen = true;
+  $('#sidebar').classList.add('open');
+  $('#sidebarBackdrop').classList.add('visible');
+}
+function closeSidebar() {
+  state.sidebarOpen = false;
+  $('#sidebar').classList.remove('open');
+  $('#sidebarBackdrop').classList.remove('visible');
+}
+function toggleSidebar() {
+  state.sidebarOpen ? closeSidebar() : openSidebar();
+}
+
+// ---------- scroll to bottom ----------
+function scrollToBottom(smooth) {
+  const main = $('#main');
+  main.scrollTo({ top: main.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+}
+
+function updateScrollBtn() {
+  const main = $('#main');
+  const atBottom = main.scrollTop + main.clientHeight >= main.scrollHeight - 200;
+  const hasContent = state.view === 'chat' && state.lastMessages.length > 0;
+  $('#scrollBtn').classList.toggle('visible', hasContent && !atBottom);
+}
+
+// ---------- modal ----------
 function attachMessageHandlers() {
-  $$('.message button[data-action="edit"]').forEach(btn => {
+  $$('.msg-line button[data-action="edit"]').forEach(btn => {
     btn.addEventListener('click', e => {
-      const msgEl = e.target.closest('.message');
+      const msgEl = e.target.closest('.msg-line');
       const msgId = msgEl.dataset.id;
-      openModal(msgId, msgEl);
+      const group = msgEl.closest('.msg-group');
+      const author = group ? group.querySelector('.author').textContent : '';
+      openModal(msgId, author, msgEl.querySelector('.content').textContent);
     });
   });
 }
 
-function openModal(msgId, msgEl) {
-  state.modalMsg = {
-    id: msgId,
-    author: msgEl.querySelector('.author').textContent,
-    content: msgEl.querySelector('.content').textContent,
-  };
-  // Use textContent to set preview safely — no HTML interpolation needed.
+function openModal(msgId, author, content) {
+  state.modalMsg = { id: msgId, author, content };
   const preview = $('#msgPreview');
   preview.textContent = '';
   const strong = document.createElement('strong');
-  strong.textContent = state.modalMsg.author;
+  strong.textContent = author;
   preview.appendChild(strong);
   preview.appendChild(document.createElement('br'));
-  preview.appendChild(document.createTextNode(state.modalMsg.content));
+  preview.appendChild(document.createTextNode(content));
 
-  $('#updateText').value = state.modalMsg.content;
-  $('#authorText').value = state.modalMsg.author;
+  $('#updateText').value = content;
+  $('#authorText').value = author;
   $('#noteText').value = '';
   $('#redactText').value = '[redacted]';
   setModalTab('redact');
   $('#editModal').classList.add('open');
+  document.body.style.overflow = 'hidden';
 }
 
 function setModalTab(tab) {
   state.modalTab = tab;
-  $$('.modal .tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  $$('.modal .tab-pane').forEach(p => p.classList.toggle('active', p.dataset.tab === tab));
-  $('#modalSave').className = tab === 'delete' ? 'danger' : 'primary';
-  $('#modalSave').textContent = tab === 'delete' ? 'Delete' : 'Save';
+  $$('.modal-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  $$('.tab-pane').forEach(p => p.classList.toggle('active', p.dataset.tab === tab));
+  const save = $('#modalSave');
+  save.className = tab === 'delete' ? 'danger' : 'primary';
+  save.textContent = tab === 'delete' ? 'Delete' : 'Save';
 }
 
 function closeModal() {
   $('#editModal').classList.remove('open');
+  document.body.style.overflow = '';
   state.modalMsg = null;
 }
 
@@ -243,7 +441,7 @@ async function saveEdit() {
   } else if (tab === 'note') {
     payload.action = 'note';
     payload.value = $('#noteText').value;
-    if (!payload.value.trim()) { alert('Note cannot be empty'); return; }
+    if (!payload.value.trim()) { toast('Note cannot be empty', 'error'); return; }
   } else if (tab === 'author') {
     payload.action = 'update';
     payload.field = 'author_name';
@@ -260,26 +458,42 @@ async function saveEdit() {
       body: JSON.stringify(payload),
     });
     closeModal();
-    if (state.view === 'chat') loadChat();
-    else if (state.view === 'search') runSearch();
-    else if (state.view === 'editlog') loadEditLog();
+    toast(tab === 'delete' ? 'Message hidden' : 'Edit saved', 'success');
+    refreshCurrent();
   } catch (e) {
-    alert('Failed to save: ' + e.message);
+    toast('Failed: ' + e.message, 'error');
   }
 }
 
+// ---------- init ----------
 document.addEventListener('DOMContentLoaded', () => {
   loadChannels();
 
-  $$('header nav button').forEach(b => {
+  $$('.view-tabs button').forEach(b => {
     b.addEventListener('click', () => setView(b.dataset.view));
   });
 
   $('#searchGo').addEventListener('click', runSearch);
   $('#searchQ').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
   $('#searchAuthor').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+  $('#searchDeleted').addEventListener('change', () => {
+    if ($('#searchQ').value || $('#searchAuthor').value) runSearch();
+  });
 
-  $$('.modal .tabs button').forEach(b => {
+  $('#refreshBtn').addEventListener('click', () => {
+    refreshCurrent();
+    toast('Refreshed');
+  });
+
+  $('#menuBtn').addEventListener('click', toggleSidebar);
+  $('#closeSidebarBtn').addEventListener('click', closeSidebar);
+  $('#sidebarBackdrop').addEventListener('click', closeSidebar);
+
+  $('#scrollBtn').addEventListener('click', () => scrollToBottom(true));
+  $('#main').addEventListener('scroll', updateScrollBtn);
+  window.addEventListener('resize', updateScrollBtn);
+
+  $$('.modal-tabs button').forEach(b => {
     b.addEventListener('click', () => setModalTab(b.dataset.tab));
   });
   $('#modalCancel').addEventListener('click', closeModal);
@@ -287,7 +501,24 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#editModal').addEventListener('click', e => {
     if (e.target.id === 'editModal') closeModal();
   });
+
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && $('#editModal').classList.contains('open')) closeModal();
+    if (e.key === 'Escape') {
+      if ($('#editModal').classList.contains('open')) closeModal();
+      else if (state.sidebarOpen) closeSidebar();
+    }
+    // Keyboard shortcuts only when not in a text field
+    const inField = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
+    if (inField) return;
+    if (e.key === '/') {
+      e.preventDefault();
+      setView('search');
+    } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      refreshCurrent();
+      toast('Refreshed');
+    } else if (e.key === 'g' && !e.metaKey && !e.ctrlKey) {
+      scrollToBottom(true);
+    }
   });
 });
