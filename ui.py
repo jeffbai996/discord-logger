@@ -37,6 +37,7 @@ CHANNEL_NAMES = {
     "1492197457369497822": "cl-3 (Claudsson primary)",
     "1491352842886447214": "fam (family/private)",
     "1491337758709383279": "claude-channel (general)",
+    "1494449115793457153": "gem (gemma channel)",
 }
 
 app = Flask(__name__)

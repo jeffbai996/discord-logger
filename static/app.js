@@ -9,6 +9,14 @@ const state = {
   modalTab: 'redact',
   lastMessages: [],
   sidebarOpen: false,
+  // live polling
+  liveInterval: 15,       // seconds between polls
+  liveTimerId: null,
+  nextPollAt: 0,          // unix ms when next poll fires
+  countdownId: null,
+  fetching: false,
+  pendingNewIds: new Set(), // ids seen since user last viewed bottom
+  documentVisible: true,
 };
 
 const $ = sel => document.querySelector(sel);
@@ -233,12 +241,13 @@ async function loadChannels() {
   $$('.channel').forEach(el => {
     el.addEventListener('click', () => {
       state.channelId = el.dataset.id;
-      state.view = 'chat';
-      setView('chat');
+      state.pendingNewIds.clear();
+      state.lastMessages = [];
+      updateNewMsgPill();
       $$('.channel').forEach(c => c.classList.toggle('active', c.dataset.id === state.channelId));
       updateCurrentChannelLabel();
       closeSidebar();
-      loadChat();
+      setView('chat');  // triggers loadChat + startLivePolling
     });
   });
 }
@@ -255,21 +264,150 @@ function updateCurrentChannelLabel() {
   el.classList.add('visible');
 }
 
-async function loadChat() {
+async function loadChat(opts = {}) {
+  const { silent = false } = opts;
   if (!state.channelId) {
     setHtml($('#content'), '<div class="empty-state">Select a channel to view messages</div>');
     return;
   }
-  setHtml($('#content'), renderSkeleton());
+  if (!silent) setHtml($('#content'), renderSkeleton());
+
+  setFetching(true);
+  let messages;
   try {
-    const messages = await api(`/api/messages/${encodeURIComponent(state.channelId)}?limit=300`);
+    messages = await api(`/api/messages/${encodeURIComponent(state.channelId)}?limit=300`);
+  } catch (e) {
+    setFetching(false);
+    if (!silent) setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+    return;
+  }
+  setFetching(false);
+
+  if (silent) {
+    // Diff against what's already rendered
+    applyLiveUpdate(messages);
+  } else {
     state.lastMessages = messages;
+    state.pendingNewIds.clear();
+    updateNewMsgPill();
     setHtml($('#content'), renderChatFeed(messages));
     attachMessageHandlers();
     scrollToBottom(false);
-  } catch (e) {
-    setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
   }
+}
+
+function applyLiveUpdate(newMessages) {
+  // API returns newest-first. Existing state.lastMessages is also newest-first.
+  const oldIds = new Set(state.lastMessages.map(m => m.id));
+  const newArrivals = newMessages.filter(m => !oldIds.has(m.id));
+
+  // Detect edits/deletes too: if any old id now has changed _edited flag or is missing
+  const newIds = new Set(newMessages.map(m => m.id));
+  const deletedCount = state.lastMessages.filter(m => !newIds.has(m.id)).length;
+  const editedCount = newMessages.filter(m => {
+    if (!oldIds.has(m.id)) return false;
+    const old = state.lastMessages.find(o => o.id === m.id);
+    if (!old) return false;
+    return JSON.stringify(old) !== JSON.stringify(m);
+  }).length;
+
+  state.lastMessages = newMessages;
+
+  const anyChange = newArrivals.length || deletedCount || editedCount;
+  if (!anyChange) return;
+
+  const main = $('#main');
+  const atBottom = main.scrollTop + main.clientHeight >= main.scrollHeight - 200;
+
+  // Re-render entire feed (simple and correct; 300 msgs is cheap)
+  setHtml($('#content'), renderChatFeed(newMessages));
+  attachMessageHandlers();
+
+  if (atBottom && newArrivals.length) {
+    // User was at bottom — pull them down to see new messages
+    scrollToBottom(true);
+    pulseLiveDot();
+  } else if (newArrivals.length) {
+    // Track for the "N new" pill
+    newArrivals.forEach(m => state.pendingNewIds.add(m.id));
+    updateNewMsgPill();
+    pulseLiveDot();
+  } else {
+    // Only edits/deletes, restore scroll
+    pulseLiveDot();
+  }
+
+  // Also refresh channel counts
+  loadChannels();
+}
+
+// ---------- live polling ----------
+function startLivePolling() {
+  stopLivePolling();
+  state.nextPollAt = Date.now() + state.liveInterval * 1000;
+  state.countdownId = setInterval(updateLiveCountdown, 500);
+  state.liveTimerId = setTimeout(livePoll, state.liveInterval * 1000);
+  updateLiveCountdown();
+}
+
+function stopLivePolling() {
+  if (state.liveTimerId) { clearTimeout(state.liveTimerId); state.liveTimerId = null; }
+  if (state.countdownId) { clearInterval(state.countdownId); state.countdownId = null; }
+  $('#liveIndicator').textContent = '';
+}
+
+async function livePoll() {
+  if (!state.documentVisible || state.view !== 'chat' || !state.channelId) {
+    // skip this tick; re-schedule
+    scheduleNextPoll();
+    return;
+  }
+  await loadChat({ silent: true });
+  scheduleNextPoll();
+}
+
+function scheduleNextPoll() {
+  state.nextPollAt = Date.now() + state.liveInterval * 1000;
+  state.liveTimerId = setTimeout(livePoll, state.liveInterval * 1000);
+}
+
+function updateLiveCountdown() {
+  const ind = $('#liveIndicator');
+  if (state.view !== 'chat' || !state.channelId) {
+    ind.textContent = '';
+    return;
+  }
+  const remaining = Math.max(0, Math.ceil((state.nextPollAt - Date.now()) / 1000));
+  if (state.fetching) {
+    ind.textContent = '• fetching';
+  } else {
+    ind.textContent = `• next ${remaining}s`;
+  }
+}
+
+function setFetching(v) {
+  state.fetching = v;
+  $('#liveDot').classList.toggle('fetching', v);
+  updateLiveCountdown();
+}
+
+function pulseLiveDot() {
+  const dot = $('#liveDot');
+  dot.classList.remove('new-messages');
+  void dot.offsetWidth; // reflow to restart animation
+  dot.classList.add('new-messages');
+  setTimeout(() => dot.classList.remove('new-messages'), 2500);
+}
+
+function updateNewMsgPill() {
+  const pill = $('#newMsgPill');
+  const count = state.pendingNewIds.size;
+  if (count === 0) {
+    pill.classList.remove('visible');
+    return;
+  }
+  $('#newMsgCount').textContent = count;
+  pill.classList.add('visible');
 }
 
 async function runSearch() {
@@ -336,8 +474,13 @@ function setView(view) {
   state.view = view;
   $$('.view-tabs button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   $('#searchBar').style.display = view === 'search' ? 'flex' : 'none';
-  if (view === 'chat') loadChat();
-  else if (view === 'search') {
+  if (view === 'chat') {
+    loadChat();
+    if (state.channelId) startLivePolling();
+  } else {
+    stopLivePolling();
+  }
+  if (view === 'search') {
     if ($('#searchQ').value || $('#searchAuthor').value) runSearch();
     else setHtml($('#content'), '<div class="empty-state">Enter a pattern and hit Search.</div>');
     setTimeout(() => $('#searchQ').focus(), 50);
@@ -378,6 +521,11 @@ function updateScrollBtn() {
   const atBottom = main.scrollTop + main.clientHeight >= main.scrollHeight - 200;
   const hasContent = state.view === 'chat' && state.lastMessages.length > 0;
   $('#scrollBtn').classList.toggle('visible', hasContent && !atBottom);
+  // If user scrolled to bottom, clear any pending-new state
+  if (atBottom && state.pendingNewIds.size > 0) {
+    state.pendingNewIds.clear();
+    updateNewMsgPill();
+  }
 }
 
 // ---------- modal ----------
@@ -490,8 +638,21 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#sidebarBackdrop').addEventListener('click', closeSidebar);
 
   $('#scrollBtn').addEventListener('click', () => scrollToBottom(true));
+  $('#newMsgPill').addEventListener('click', () => {
+    scrollToBottom(true);
+    state.pendingNewIds.clear();
+    updateNewMsgPill();
+  });
   $('#main').addEventListener('scroll', updateScrollBtn);
   window.addEventListener('resize', updateScrollBtn);
+
+  document.addEventListener('visibilitychange', () => {
+    state.documentVisible = !document.hidden;
+    if (state.documentVisible && state.view === 'chat' && state.channelId) {
+      // Catch up immediately when tab returns to foreground
+      livePoll();
+    }
+  });
 
   $$('.modal-tabs button').forEach(b => {
     b.addEventListener('click', () => setModalTab(b.dataset.tab));

@@ -97,14 +97,36 @@
 
   .brand {
     display: flex; align-items: center; gap: 8px;
-    font-weight: 700; font-size: 15px;
+    font-weight: 700; font-size: 14px;
     color: var(--accent);
     letter-spacing: -0.01em;
+    white-space: nowrap;
   }
   .brand-dot {
     width: 8px; height: 8px; border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 8px var(--success);
+    flex-shrink: 0;
+    transition: background 0.2s, box-shadow 0.2s;
+  }
+  .brand-dot.fetching {
+    background: var(--warn);
+    box-shadow: 0 0 8px var(--warn);
+  }
+  .brand-dot.new-messages {
+    animation: pulse-green 1.2s ease-out 2;
+  }
+  @keyframes pulse-green {
+    0% { transform: scale(1); box-shadow: 0 0 8px var(--success); }
+    50% { transform: scale(1.6); box-shadow: 0 0 16px var(--success); }
+    100% { transform: scale(1); box-shadow: 0 0 8px var(--success); }
+  }
+  .live-indicator {
+    color: var(--text-faint);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    margin-left: 4px;
+    white-space: nowrap;
   }
   .current-channel {
     color: var(--text-dim);
@@ -399,6 +421,25 @@
   .scroll-btn:hover { transform: translateY(-2px); }
   .scroll-btn.visible { display: flex; }
 
+  /* New-messages pill that appears when new messages arrive and user is scrolled up */
+  .new-msg-pill {
+    position: absolute;
+    bottom: 76px; right: 20px;
+    background: var(--accent); color: var(--bg);
+    border: none; padding: 8px 14px;
+    border-radius: 20px;
+    cursor: pointer; font-weight: 600; font-size: 13px;
+    box-shadow: var(--shadow-lg);
+    display: none;
+    align-items: center; gap: 6px;
+    z-index: 20;
+  }
+  .new-msg-pill.visible { display: flex; animation: pillIn 0.25s ease-out; }
+  @keyframes pillIn {
+    from { transform: translateY(8px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+
   /* ---------- Edit log ---------- */
   .edit-log-entry {
     padding: 10px 14px;
@@ -646,8 +687,9 @@
       </svg>
     </button>
     <div class="brand">
-      <span class="brand-dot" title="live"></span>
-      <span>discord-logger</span>
+      <span class="brand-dot" id="liveDot" title="live"></span>
+      <span class="brand-text">logger</span>
+      <span class="live-indicator" id="liveIndicator"></span>
     </div>
     <span class="current-channel" id="currentChannel"></span>
     <div class="spacer"></div>
@@ -692,6 +734,12 @@
     </div>
     <button class="scroll-btn" id="scrollBtn" aria-label="Scroll to bottom">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"/>
+      </svg>
+    </button>
+    <button class="new-msg-pill" id="newMsgPill">
+      <span id="newMsgCount">0</span> new
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="6 9 12 15 18 9"/>
       </svg>
     </button>
