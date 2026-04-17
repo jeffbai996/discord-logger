@@ -1,6 +1,7 @@
 """Discord channel logger — polls channels and appends messages to JSONL files."""
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -39,7 +40,11 @@ def get_config() -> dict:
 
     log_dir = Path(os.getenv("LOG_DIR", "./logs"))
     state_dir = Path(os.getenv("STATE_DIR", "./state"))
-    poll_interval = int(os.getenv("POLL_INTERVAL", "300"))
+    try:
+        poll_interval = int(os.getenv("POLL_INTERVAL", "300"))
+    except ValueError:
+        log.error("POLL_INTERVAL must be an integer, got: %r", os.getenv("POLL_INTERVAL"))
+        sys.exit(1)
 
     log_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -70,15 +75,19 @@ def save_last_message_id(state_dir: Path, channel_id: str, message_id: str) -> N
 
 def fetch_messages(
     token: str, channel_id: str, after: Optional[str] = None, limit: int = 100
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Fetch up to `limit` messages from a Discord channel via REST API.
 
     Paginates automatically when limit > 100 (Discord's per-request max).
-    Returns messages oldest-first.
+    Honors 429 Retry-After once per call before giving up.
+    Returns (messages_oldest_first, complete) where complete=False means a
+    request failed mid-pagination — callers must NOT advance state in that case,
+    or they'll skip over unfetched messages on the next poll.
     """
     headers = {"Authorization": f"Bot {token}"}
     all_messages: list[dict] = []
     cursor = after
+    complete = True
 
     while len(all_messages) < limit:
         batch_size = min(100, limit - len(all_messages))
@@ -93,9 +102,20 @@ def fetch_messages(
                 params=params,
                 timeout=15,
             )
+            if resp.status_code == 429:
+                retry_after = float(
+                    resp.headers.get("Retry-After")
+                    or resp.headers.get("X-RateLimit-Reset-After")
+                    or 1.0
+                )
+                retry_after = min(retry_after, 60.0)  # cap — don't stall cron forever
+                log.warning("429 on channel %s, sleeping %.1fs", channel_id, retry_after)
+                time.sleep(retry_after)
+                continue  # retry same page
             resp.raise_for_status()
         except requests.RequestException as e:
             log.error("Failed to fetch channel %s: %s", channel_id, e)
+            complete = False
             break
 
         batch = resp.json()
@@ -112,11 +132,16 @@ def fetch_messages(
 
         time.sleep(0.5)  # rate limit courtesy between pages
 
-    return all_messages
+    return all_messages, complete
 
 
 def slim_message(msg: dict) -> dict:
-    """Extract the fields we care about from a Discord message object."""
+    """Extract the fields we care about from a Discord message object.
+
+    Tolerant of missing/null fields — Discord can return messages with
+    null author (deleted accounts, some system events) that would otherwise
+    crash the whole poll and leave state unadvanced.
+    """
     attachments = [
         {
             "id": att.get("id"),
@@ -125,20 +150,21 @@ def slim_message(msg: dict) -> dict:
             "size": att.get("size"),
             "url": att.get("url"),
         }
-        for att in msg.get("attachments", [])
+        for att in (msg.get("attachments") or [])
     ]
 
+    author = msg.get("author") or {}
     record: dict = {
         "id": msg["id"],
-        "channel_id": msg["channel_id"],
-        "timestamp": msg["timestamp"],
-        "author_id": msg["author"]["id"],
-        "author_name": msg["author"].get("username", "unknown"),
+        "channel_id": msg.get("channel_id", ""),
+        "timestamp": msg.get("timestamp", ""),
+        "author_id": author.get("id", ""),
+        "author_name": author.get("username", "unknown"),
         "content": msg.get("content", ""),
     }
     if attachments:
         record["attachments"] = attachments
-    reply_to = msg.get("message_reference", {}).get("message_id")
+    reply_to = (msg.get("message_reference") or {}).get("message_id")
     if reply_to:
         record["reply_to"] = reply_to
 
@@ -150,10 +176,12 @@ def poll_channel(
 ) -> int:
     """Fetch new messages for a channel and append to its log file.
 
-    Returns the number of new messages logged.
+    Returns the number of new messages logged. Advances state to the last
+    successfully-fetched message even on partial failures — Discord's `after`
+    cursor guarantees no gaps, so partial fetches are safe to persist.
     """
     after = get_last_message_id(state_dir, channel_id)
-    all_messages = fetch_messages(token, channel_id, after=after)
+    all_messages, complete = fetch_messages(token, channel_id, after=after)
 
     if not all_messages:
         return 0
@@ -164,7 +192,13 @@ def poll_channel(
             f.write(json.dumps(slim_message(msg), ensure_ascii=False) + "\n")
 
     save_last_message_id(state_dir, channel_id, all_messages[-1]["id"])
-    log.info("Channel %s: logged %d new messages", channel_id, len(all_messages))
+    if complete:
+        log.info("Channel %s: logged %d new messages", channel_id, len(all_messages))
+    else:
+        log.warning(
+            "Channel %s: logged %d messages (partial — remainder fetched next poll)",
+            channel_id, len(all_messages),
+        )
     return len(all_messages)
 
 
@@ -187,44 +221,57 @@ BACKOFF_INTERVAL = 1800  # skip polls for 30 min during idle
 def run_once(config: dict) -> int:
     """Poll all channels once. Returns total new messages.
 
+    Held under a per-state_dir file lock so concurrent invocations (e.g. `watch`
+    + cron `once`) don't corrupt state or double-fetch. Lock is non-blocking:
+    if another instance holds it, this one skips immediately.
+
     Implements adaptive backoff: if no messages for IDLE_THRESHOLD seconds,
     sets a next-poll timestamp BACKOFF_INTERVAL seconds in the future.
     Cron invocations that land before that timestamp are skipped.
     Any new messages reset to normal polling immediately.
     """
     state_dir = config["state_dir"]
-    next_poll_file = state_dir / "next_poll.txt"
-    activity_file = state_dir / "last_activity.txt"
+    lock_file = state_dir / "poll.lock"
 
-    # Check if we're in backoff — skip if next poll is in the future
-    next_poll = _read_timestamp(next_poll_file)
-    now = time.time()
-    if next_poll and now < next_poll:
-        log.info("Idle backoff — next poll in %ds, skipping", int(next_poll - now))
-        return 0
+    with open(lock_file, "w") as lock_fh:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info("Another poll is in progress, skipping")
+            return 0
 
-    total = 0
-    for channel_id in config["channel_ids"]:
-        total += poll_channel(
-            config["token"], channel_id, config["log_dir"], config["state_dir"]
-        )
+        next_poll_file = state_dir / "next_poll.txt"
+        activity_file = state_dir / "last_activity.txt"
 
-    if total > 0:
-        # Activity detected — reset to normal polling
-        _write_timestamp(activity_file, now)
-        next_poll_file.unlink(missing_ok=True)
-    else:
-        # No messages — check if idle long enough to backoff
-        last_activity = _read_timestamp(activity_file)
-        if last_activity is None:
-            # First run or missing file — seed it
+        # Check if we're in backoff — skip if next poll is in the future
+        next_poll = _read_timestamp(next_poll_file)
+        now = time.time()
+        if next_poll and now < next_poll:
+            log.info("Idle backoff — next poll in %ds, skipping", int(next_poll - now))
+            return 0
+
+        total = 0
+        for channel_id in config["channel_ids"]:
+            total += poll_channel(
+                config["token"], channel_id, config["log_dir"], config["state_dir"]
+            )
+
+        if total > 0:
+            # Activity detected — reset to normal polling
             _write_timestamp(activity_file, now)
-        elif now - last_activity >= IDLE_THRESHOLD:
-            _write_timestamp(next_poll_file, now + BACKOFF_INTERVAL)
-            log.info("No activity for %dm — backing off for %dm",
-                     int((now - last_activity) / 60), BACKOFF_INTERVAL // 60)
+            next_poll_file.unlink(missing_ok=True)
+        else:
+            # No messages — check if idle long enough to backoff
+            last_activity = _read_timestamp(activity_file)
+            if last_activity is None:
+                # First run or missing file — seed it
+                _write_timestamp(activity_file, now)
+            elif now - last_activity >= IDLE_THRESHOLD:
+                _write_timestamp(next_poll_file, now + BACKOFF_INTERVAL)
+                log.info("No activity for %dm — backing off for %dm",
+                         int((now - last_activity) / 60), BACKOFF_INTERVAL // 60)
 
-    return total
+        return total
 
 
 def run_watch(config: dict) -> None:
@@ -282,7 +329,7 @@ def main() -> None:
         for channel_id in config["channel_ids"]:
             log_file = config["log_dir"] / f"{channel_id}.jsonl"
             seen_ids = _get_seen_ids(log_file)
-            messages = fetch_messages(config["token"], channel_id, limit=args.limit)
+            messages, _ = fetch_messages(config["token"], channel_id, limit=args.limit)
             new = [m for m in messages if m["id"] not in seen_ids]
             if not new:
                 log.info("Channel %s: nothing new to backfill", channel_id)

@@ -28,7 +28,11 @@ def search_logs(
     """
     log_path = Path(log_dir)
     results: list[dict] = []
-    regex = re.compile(pattern, re.IGNORECASE) if pattern else None
+    try:
+        regex = re.compile(pattern, re.IGNORECASE) if pattern else None
+    except re.error as e:
+        print(f"Invalid regex pattern: {e}", file=sys.stderr)
+        sys.exit(2)
 
     files = sorted(log_path.glob("*.jsonl"))
     if channel_id:
