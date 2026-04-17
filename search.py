@@ -49,10 +49,8 @@ def search_logs(
                 continue
 
             results.append(msg)
-            if len(results) >= limit:
-                return results
 
-    return results
+    return results[:limit]
 
 
 def format_message(msg: dict) -> str:

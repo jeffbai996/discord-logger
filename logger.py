@@ -1,5 +1,6 @@
 """Discord channel logger — polls channels and appends messages to JSONL files."""
 
+import argparse
 import json
 import logging
 import os
@@ -70,55 +71,78 @@ def save_last_message_id(state_dir: Path, channel_id: str, message_id: str) -> N
 def fetch_messages(
     token: str, channel_id: str, after: Optional[str] = None, limit: int = 100
 ) -> list[dict]:
-    """Fetch messages from a Discord channel via REST API.
+    """Fetch up to `limit` messages from a Discord channel via REST API.
 
-    Returns messages oldest-first. Discord returns newest-first,
-    so we reverse before returning.
+    Paginates automatically when limit > 100 (Discord's per-request max).
+    Returns messages oldest-first.
     """
     headers = {"Authorization": f"Bot {token}"}
-    params: dict = {"limit": limit}
-    if after:
-        params["after"] = after
+    all_messages: list[dict] = []
+    cursor = after
 
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/channels/{channel_id}/messages",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log.error("Failed to fetch channel %s: %s", channel_id, e)
-        return []
+    while len(all_messages) < limit:
+        batch_size = min(100, limit - len(all_messages))
+        params: dict = {"limit": batch_size}
+        if cursor:
+            params["after"] = cursor
 
-    messages = resp.json()
-    messages.reverse()  # oldest first
-    return messages
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/channels/{channel_id}/messages",
+                headers=headers,
+                params=params,
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log.error("Failed to fetch channel %s: %s", channel_id, e)
+            break
+
+        batch = resp.json()
+        if not batch:
+            break
+
+        # Discord returns newest-first; reverse to get oldest-first
+        batch.reverse()
+        all_messages.extend(batch)
+        cursor = batch[-1]["id"]
+
+        if len(batch) < batch_size:
+            break  # no more pages
+
+        time.sleep(0.5)  # rate limit courtesy between pages
+
+    return all_messages
 
 
 def slim_message(msg: dict) -> dict:
     """Extract the fields we care about from a Discord message object."""
-    attachments = []
-    for att in msg.get("attachments", []):
-        attachments.append({
+    attachments = [
+        {
             "id": att.get("id"),
             "filename": att.get("filename"),
             "content_type": att.get("content_type"),
             "size": att.get("size"),
             "url": att.get("url"),
-        })
+        }
+        for att in msg.get("attachments", [])
+    ]
 
-    return {
+    record: dict = {
         "id": msg["id"],
         "channel_id": msg["channel_id"],
         "timestamp": msg["timestamp"],
         "author_id": msg["author"]["id"],
         "author_name": msg["author"].get("username", "unknown"),
         "content": msg.get("content", ""),
-        "attachments": attachments if attachments else None,
-        "reply_to": msg.get("message_reference", {}).get("message_id"),
     }
+    if attachments:
+        record["attachments"] = attachments
+    reply_to = msg.get("message_reference", {}).get("message_id")
+    if reply_to:
+        record["reply_to"] = reply_to
+
+    return record
 
 
 def poll_channel(
@@ -129,19 +153,7 @@ def poll_channel(
     Returns the number of new messages logged.
     """
     after = get_last_message_id(state_dir, channel_id)
-    all_messages: list[dict] = []
-
-    # Paginate — Discord returns max 100 per request
-    cursor = after
-    while True:
-        batch = fetch_messages(token, channel_id, after=cursor)
-        if not batch:
-            break
-        all_messages.extend(batch)
-        cursor = batch[-1]["id"]
-        if len(batch) < 100:
-            break
-        time.sleep(0.5)  # rate limit courtesy
+    all_messages = fetch_messages(token, channel_id, after=after)
 
     if not all_messages:
         return 0
@@ -149,10 +161,7 @@ def poll_channel(
     log_file = log_dir / f"{channel_id}.jsonl"
     with open(log_file, "a", encoding="utf-8") as f:
         for msg in all_messages:
-            slim = slim_message(msg)
-            # Drop None values to keep lines compact
-            slim = {k: v for k, v in slim.items() if v is not None}
-            f.write(json.dumps(slim, ensure_ascii=False) + "\n")
+            f.write(json.dumps(slim_message(msg), ensure_ascii=False) + "\n")
 
     save_last_message_id(state_dir, channel_id, all_messages[-1]["id"])
     log.info("Channel %s: logged %d new messages", channel_id, len(all_messages))
@@ -230,30 +239,58 @@ def run_watch(config: dict) -> None:
         time.sleep(config["poll_interval"])
 
 
-def main() -> None:
-    config = get_config()
-    mode = sys.argv[1] if len(sys.argv) > 1 else "once"
+def _get_seen_ids(log_file: Path) -> set[str]:
+    """Read all message IDs already in a log file to prevent duplicates."""
+    if not log_file.exists():
+        return set()
+    seen = set()
+    for line in log_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            seen.add(json.loads(line)["id"])
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return seen
 
-    if mode == "watch":
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Discord channel logger")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="once",
+        choices=["once", "watch", "backfill"],
+        help="once (default), watch (continuous), backfill (fetch last N messages)",
+    )
+    parser.add_argument(
+        "limit",
+        nargs="?",
+        type=int,
+        default=100,
+        help="Message limit for backfill mode (default 100)",
+    )
+    args = parser.parse_args()
+    config = get_config()
+
+    if args.mode == "watch":
         run_watch(config)
-    elif mode == "once":
+    elif args.mode == "once":
         total = run_once(config)
         log.info("Done — %d new message(s) total", total)
-    elif mode == "backfill":
-        # Backfill ignores state — fetches last N messages
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    elif args.mode == "backfill":
         for channel_id in config["channel_ids"]:
-            messages = fetch_messages(config["token"], channel_id, limit=min(limit, 100))
             log_file = config["log_dir"] / f"{channel_id}.jsonl"
+            seen_ids = _get_seen_ids(log_file)
+            messages = fetch_messages(config["token"], channel_id, limit=args.limit)
+            new = [m for m in messages if m["id"] not in seen_ids]
+            if not new:
+                log.info("Channel %s: nothing new to backfill", channel_id)
+                continue
             with open(log_file, "a", encoding="utf-8") as f:
-                for msg in messages:
-                    slim = slim_message(msg)
-                    slim = {k: v for k, v in slim.items() if v is not None}
-                    f.write(json.dumps(slim, ensure_ascii=False) + "\n")
-            log.info("Backfilled %d messages for channel %s", len(messages), channel_id)
-    else:
-        print("Usage: python logger.py [once|watch|backfill [limit]]")
-        sys.exit(1)
+                for msg in new:
+                    f.write(json.dumps(slim_message(msg), ensure_ascii=False) + "\n")
+            log.info("Backfilled %d messages for channel %s", len(new), channel_id)
 
 
 if __name__ == "__main__":
