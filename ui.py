@@ -98,6 +98,17 @@ MAX_BACKUPS_PER_BOT = 10
 # from asking for enough rows to OOM the server.
 MAX_QUERY_LIMIT = 500
 
+# Per-message cap on how much content a user regex scans. Python's `re` has no
+# timeout primitive, so truncating the search surface is the cheapest defense
+# against catastrophic backtracking like `(a+)+b` on a long line.
+SEARCH_CONTENT_SCAN_LIMIT = 4096
+
+# Reject obviously pathological patterns before compiling. Not exhaustive; the
+# truncation above is the real defense. This catches the classic nested-
+# quantifier shape `(X+)+` / `(X*)*` / mixed — where X is any single literal
+# or character class — which is what makes catastrophic backtracking trivial.
+_REDOS_PATTERNS = re.compile(r"\([^)]*[+*]\)[+*]")
+
 app = Flask(__name__)
 # Reject oversized request bodies at the WSGI layer before we allocate for
 # them. 512KB comfortably covers a 200KB persona/memory edit plus JSON framing.
@@ -212,6 +223,76 @@ def ordered_channels() -> list[str]:
     return ordered + unknowns
 
 
+def channel_dashboard_stats(channel_id: str, hours: int = 24, buckets: int = 8) -> dict:
+    """Single-pass dashboard stats: count + last-message preview + activity buckets.
+
+    The dashboard route used to call channel_message_count, channel_last_message,
+    and channel_activity in series — three full reads of the same JSONL. This
+    helper folds all three into one iterator pass. The individual helpers are
+    kept for other callers.
+    """
+    log_file = LOG_DIR / f"{channel_id}.jsonl"
+    count = 0
+    last_preview: Optional[dict] = None
+    counts = [0] * buckets
+    if not log_file.exists():
+        return {"count": count, "last_message": None, "activity": counts, "size_bytes": 0}
+
+    size_bytes = log_file.stat().st_size
+    now_ts = datetime.now(timezone.utc).timestamp()
+    window_start = now_ts - hours * 3600
+    bucket_size = (hours * 3600) / buckets
+
+    try:
+        # Iterate the file as a line stream instead of materialising
+        # splitlines() on the full text. Keeps peak memory bounded at one line
+        # even when channels grow multi-MB.
+        with log_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    msg = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                count += 1
+                # Newest line overwrites the preview so when we fall out of
+                # the loop the last surviving msg wins.
+                last_preview = msg
+
+                ts = msg.get("timestamp", "")
+                if ts:
+                    try:
+                        t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        t = None
+                    if t is not None and t >= window_start:
+                        idx = int((t - window_start) / bucket_size)
+                        if idx < 0:
+                            idx = 0
+                        elif idx >= buckets:
+                            idx = buckets - 1
+                        counts[idx] += 1
+    except Exception as e:
+        log.warning("dashboard stats read failed for %s: %s", channel_id, e)
+
+    last_summary: Optional[dict] = None
+    if last_preview is not None:
+        last_summary = {
+            "author": last_preview.get("author_name", "?"),
+            "content": (last_preview.get("content") or "")[:120],
+            "timestamp": last_preview.get("timestamp", ""),
+            "id": last_preview.get("id", ""),
+        }
+    return {
+        "count": count,
+        "last_message": last_summary,
+        "activity": counts,
+        "size_bytes": size_bytes,
+    }
+
+
 def channel_last_message(channel_id: str) -> Optional[dict]:
     """Get the last message (newest) as a preview summary."""
     log_file = LOG_DIR / f"{channel_id}.jsonl"
@@ -303,18 +384,16 @@ def api_dashboard():
     total_log_bytes = 0
     total_msgs = 0
     for cid in ordered_channels():
-        log_file = LOG_DIR / f"{cid}.jsonl"
-        size = log_file.stat().st_size if log_file.exists() else 0
-        count = channel_message_count(cid)
-        total_log_bytes += size
-        total_msgs += count
+        stats = channel_dashboard_stats(cid, hours=24, buckets=8)
+        total_log_bytes += stats["size_bytes"]
+        total_msgs += stats["count"]
         cards.append({
             "id": cid,
             "name": CHANNEL_NAMES.get(cid, cid),
-            "count": count,
-            "size_bytes": size,
-            "last_message": channel_last_message(cid),
-            "activity": channel_activity(cid, hours=24, buckets=8),
+            "count": stats["count"],
+            "size_bytes": stats["size_bytes"],
+            "last_message": stats["last_message"],
+            "activity": stats["activity"],
         })
 
     edits_bytes = EDITS_FILE.stat().st_size if EDITS_FILE.exists() else 0
@@ -363,6 +442,8 @@ def api_search():
     if not q and not author:
         return jsonify([])
 
+    if q and _REDOS_PATTERNS.search(q):
+        return jsonify({"error": "regex rejected: nested quantifier pattern"}), 400
     try:
         regex = re.compile(q, re.IGNORECASE) if q else None
     except re.error as e:
@@ -395,8 +476,12 @@ def api_search():
                 else:
                     msg = folded
 
-            if regex and not regex.search(msg.get("content", "")):
-                continue
+            if regex:
+                # Cap the substring the regex sees per message. Messages are
+                # usually short; long ones get searched only in their prefix.
+                content = (msg.get("content") or "")[:SEARCH_CONTENT_SCAN_LIMIT]
+                if not regex.search(content):
+                    continue
             if author and author.lower() not in msg.get("author_name", "").lower():
                 continue
 
