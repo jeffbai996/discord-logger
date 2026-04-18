@@ -74,6 +74,21 @@ avoid stalling cron). For 5xx and network errors, pagination stops and the
 cursor advances to the last successfully-fetched message — Discord's `after`
 parameter guarantees no gaps, so the next poll resumes cleanly.
 
+## Web UI
+
+The Flask web UI at `ui.py` runs on port 5050 (default) and is meant for
+Tailscale-only access — it has no authentication.
+
+For local use, `python ui.py` is fine. For the fragserv deployment, prefer
+gunicorn so a stuck request doesn't block the whole UI:
+
+```
+gunicorn -w 2 -b 0.0.0.0:5050 --timeout 30 ui:app
+```
+
+The systemd user unit `discord-logger-ui.service` can use either; switch its
+`ExecStart` line when you want the upgrade.
+
 ## License
 
 MIT

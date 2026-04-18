@@ -114,6 +114,17 @@ app = Flask(__name__)
 # them. 512KB comfortably covers a 200KB persona/memory edit plus JSON framing.
 app.config["MAX_CONTENT_LENGTH"] = 512 * 1024
 
+
+def _ise(where: str, status: int = 500):
+    """Log the current exception with context and return a generic JSON error.
+
+    We don't surface `str(e)` to clients — exception strings from fs/fcntl ops
+    can leak absolute paths like `/home/jbai/...`. The traceback still lands
+    in server logs under `log.exception`.
+    """
+    log.exception("%s failed", where)
+    return jsonify({"error": f"{where} failed"}), status
+
 # Simple mtime-based cache for edits. Reloaded on disk change or POST.
 _edits_cache: dict[str, list[dict]] = {}
 _edits_mtime: float = 0.0
@@ -146,6 +157,13 @@ def load_edits() -> dict[str, list[dict]]:
     return _edits_cache
 
 
+# Fields that `apply_edits(action="update")` is allowed to overwrite when
+# folding edits at read time. The POST handler enforces the same whitelist,
+# but a hand-edit to edits.jsonl could sneak in arbitrary field names
+# (including sentinels like `_edited`/`_notes`) — block them here too.
+_EDITABLE_FIELDS = frozenset({"content", "author_name"})
+
+
 def apply_edits(msg: dict, edits: list[dict]) -> Optional[dict]:
     """Apply edits in order. Returns None if deleted."""
     result = dict(msg)
@@ -161,7 +179,7 @@ def apply_edits(msg: dict, edits: list[dict]) -> Optional[dict]:
             edited = True
         elif action == "update":
             field = e.get("field")
-            if field:
+            if field in _EDITABLE_FIELDS:
                 result[field] = e.get("value", "")
                 edited = True
         elif action == "note":
@@ -703,12 +721,12 @@ def api_bot_write(bot_id: str):
     try:
         backup_path = _backup_file(target, BOT_BACKUP_DIR, bot_id)
     except Exception as e:
-        return jsonify({"error": f"backup failed: {e}"}), 500
+        return _ise("backup")
 
     try:
         _atomic_write(target, encoded)
     except Exception as e:
-        return jsonify({"error": f"write failed: {e}"}), 500
+        return _ise("write")
 
     _prune_backups_for(BOT_BACKUP_DIR, bot_id, MAX_BACKUPS_PER_BOT)
     backup_name = backup_path.name if backup_path else None
@@ -742,7 +760,7 @@ def api_bot_restore(bot_id: str):
         pre_backup = _backup_file(target, BOT_BACKUP_DIR, bot_id)
         _atomic_write(target, backup_path.read_bytes())
     except Exception as e:
-        return jsonify({"error": f"restore failed: {e}"}), 500
+        return _ise("restore")
 
     _prune_backups_for(BOT_BACKUP_DIR, bot_id, MAX_BACKUPS_PER_BOT)
     log.info("Restored %s from %s", target, name)
@@ -886,12 +904,12 @@ def api_squad_write(entry_id: str):
     try:
         backup_path = _backup_file(target, SQUAD_BACKUP_DIR, prefix)
     except Exception as e:
-        return jsonify({"error": f"backup failed: {e}"}), 500
+        return _ise("backup")
 
     try:
         _atomic_write(target, encoded)
     except Exception as e:
-        return jsonify({"error": f"write failed: {e}"}), 500
+        return _ise("write")
 
     _prune_backups_for(SQUAD_BACKUP_DIR, prefix, MAX_SQUAD_BACKUPS)
     backup_name = backup_path.name if backup_path else None
@@ -924,7 +942,7 @@ def api_squad_restore(entry_id: str):
         pre_backup = _backup_file(target, SQUAD_BACKUP_DIR, prefix)
         _atomic_write(target, backup_path.read_bytes())
     except Exception as e:
-        return jsonify({"error": f"restore failed: {e}"}), 500
+        return _ise("restore")
 
     _prune_backups_for(SQUAD_BACKUP_DIR, prefix, MAX_SQUAD_BACKUPS)
     log.info("Restored squad %s from %s", target, name)
@@ -962,7 +980,7 @@ def api_squad_memory_create():
     try:
         _atomic_write(target, encoded)
     except Exception as e:
-        return jsonify({"error": f"write failed: {e}"}), 500
+        return _ise("write")
 
     log.info("Created memory: %s (%d bytes)", target, len(encoded))
     return jsonify({
@@ -993,12 +1011,36 @@ def api_squad_memory_soft_delete(stem: str):
     try:
         target.rename(deleted_path)
     except Exception as e:
-        return jsonify({"error": f"delete failed: {e}"}), 500
+        return _ise("delete")
 
     log.info("Soft-deleted memory: %s -> %s", target, deleted_path)
     return jsonify({"ok": True, "renamed_to": deleted_name})
 
 
+def _prune_soft_deleted_memories(max_age_days: int = 30) -> int:
+    """Permanently delete `<name>.md.deleted-<ts>` files older than `max_age_days`.
+
+    Soft-delete never auto-cleans, so these accumulate every time the user
+    removes a memory from the UI. We run this on startup — cheap directory
+    scan, and the unit is days so it's not time-sensitive.
+    """
+    if not SQUAD_MEMORIES_DIR.exists():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    pruned = 0
+    for p in SQUAD_MEMORIES_DIR.glob("*.md.deleted-*"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                pruned += 1
+        except Exception as e:
+            log.warning("prune soft-deleted %s: %s", p, e)
+    if pruned:
+        log.info("Pruned %d soft-deleted memories older than %d days", pruned, max_age_days)
+    return pruned
+
+
 if __name__ == "__main__":
+    _prune_soft_deleted_memories()
     log.info("Starting UI on 0.0.0.0:%d — logs=%s edits=%s", PORT, LOG_DIR, EDITS_FILE)
     app.run(host="0.0.0.0", port=PORT, debug=False)
