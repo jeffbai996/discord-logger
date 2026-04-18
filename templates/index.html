@@ -474,6 +474,254 @@
     padding-left: 0;
   }
 
+  /* ---------- Dashboard ---------- */
+  .dash-header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 12px; flex-wrap: wrap; gap: 8px;
+  }
+  .dash-header h2 {
+    margin: 0; font-size: 18px; font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .dash-totals {
+    display: flex; flex-wrap: wrap; gap: 6px 18px;
+    color: var(--text-dim); font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .dash-totals strong { color: var(--text); font-weight: 600; }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+
+  .dash-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: border-color 0.15s, transform 0.1s;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 140px;
+  }
+  .dash-card:hover {
+    border-color: var(--accent-dim);
+    transform: translateY(-1px);
+  }
+  .dash-card-top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px;
+  }
+  .dash-card-name {
+    font-weight: 700; font-size: 15px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dash-card-count {
+    color: var(--text-faint); font-size: 11.5px;
+    font-variant-numeric: tabular-nums; flex-shrink: 0;
+  }
+  .dash-card-preview {
+    color: var(--text-dim); font-size: 13px;
+    display: -webkit-box; -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical; overflow: hidden;
+    line-height: 1.4; flex: 1;
+  }
+  .dash-card-preview .prev-author {
+    color: var(--accent); font-weight: 600;
+  }
+  .dash-card-meta {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-top: auto;
+  }
+  .dash-card-meta .size {
+    color: var(--text-faint); font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .dash-card-meta .when {
+    color: var(--text-faint); font-size: 11.5px;
+  }
+  .sparkline {
+    display: flex; align-items: flex-end; gap: 2px; height: 24px;
+  }
+  .sparkline .bar {
+    flex: 1; background: var(--accent); opacity: 0.7;
+    border-radius: 2px 2px 0 0; min-height: 2px;
+  }
+  .sparkline .bar.empty {
+    background: var(--border); opacity: 1;
+  }
+
+  /* ---------- Bots ---------- */
+  .bot-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 12px;
+  }
+  .bot-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .bot-card-top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px;
+  }
+  .bot-card-name {
+    font-weight: 700; font-size: 15px; color: var(--accent);
+  }
+  .bot-card-desc {
+    color: var(--text-dim); font-size: 12.5px;
+  }
+  .bot-card-file {
+    color: var(--text-faint); font-size: 11px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bot-card-meta {
+    display: flex; gap: 12px; color: var(--text-faint); font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .bot-card .primary-btn {
+    margin-top: 4px; align-self: flex-start;
+    background: var(--accent); color: var(--bg);
+    border: none; padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    cursor: pointer; font-weight: 600; font-size: 13px;
+  }
+  .bot-card .primary-btn:hover { background: var(--accent-strong); }
+
+  /* Bot editor (full-screen overlay, uses modal machinery) */
+  .bot-editor-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: none;
+    z-index: 150;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+  }
+  .bot-editor-overlay.open { display: flex; flex-direction: column; }
+  .bot-editor {
+    flex: 1; margin: 20px; display: flex; flex-direction: column;
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow-lg);
+  }
+  .bot-editor-head {
+    padding: 12px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev-2);
+  }
+  .bot-editor-head .title {
+    font-weight: 700; font-size: 15px;
+  }
+  .bot-editor-head .file {
+    color: var(--text-faint); font-size: 11.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .bot-editor-head .close-x {
+    background: none; border: none; color: var(--text-dim);
+    padding: 6px; cursor: pointer; border-radius: 4px;
+  }
+  .bot-editor-head .close-x:hover { background: var(--bg-hover); color: var(--text); }
+
+  .bot-editor-body {
+    flex: 1; display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .bot-editor-textarea {
+    flex: 1; width: 100%;
+    background: var(--bg); color: var(--text);
+    border: none; outline: none;
+    padding: 16px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; line-height: 1.55;
+    resize: none;
+  }
+
+  .bot-editor-foot {
+    padding: 10px 16px;
+    display: flex; flex-wrap: wrap; gap: 8px;
+    align-items: center; justify-content: space-between;
+    border-top: 1px solid var(--border);
+    background: var(--bg-elev);
+  }
+  .bot-editor-foot .stats {
+    color: var(--text-faint); font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .bot-editor-foot .buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  .bot-editor-foot button {
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 7px 14px;
+    border-radius: var(--radius-sm); cursor: pointer; font-weight: 500;
+    font-size: 13px;
+  }
+  .bot-editor-foot button:hover { border-color: var(--border-strong); }
+  .bot-editor-foot .primary {
+    background: var(--accent); color: var(--bg);
+    border-color: var(--accent); font-weight: 600;
+  }
+  .bot-editor-foot .primary:disabled {
+    opacity: 0.4; cursor: not-allowed;
+  }
+  .bot-editor-foot .primary:hover:not(:disabled) { background: var(--accent-strong); }
+  .bot-editor-foot .danger {
+    background: var(--danger-soft); color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  /* Diff preview modal */
+  .diff-block {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.5;
+    max-height: 400px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .diff-block .add { background: rgba(158, 206, 106, 0.15); color: #9ece6a; }
+  .diff-block .del { background: rgba(247, 118, 142, 0.15); color: #f7768e; text-decoration: line-through; }
+  .diff-block .ctx { color: var(--text-dim); }
+
+  .backup-list {
+    display: flex; flex-direction: column; gap: 6px;
+    max-height: 300px; overflow-y: auto;
+  }
+  .backup-item {
+    padding: 8px 12px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 8px; font-size: 13px;
+  }
+  .backup-item .bk-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; color: var(--text-dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .backup-item button {
+    background: var(--accent-soft); color: var(--accent);
+    border: none; padding: 4px 10px;
+    border-radius: 4px; cursor: pointer; font-size: 12px;
+    flex-shrink: 0;
+  }
+  .backup-item button:hover { background: var(--accent-dim); color: var(--bg); }
+
+  @media (max-width: 767px) {
+    .bot-editor { margin: 0; border-radius: 0; border: none; }
+    .bot-editor-head { padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); }
+    .bot-editor-foot { padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+    .bot-editor-textarea { padding: 12px; font-size: 13.5px; }
+  }
+
   /* ---------- Modal ---------- */
   .modal-overlay {
     position: fixed; inset: 0;
@@ -694,9 +942,11 @@
     <span class="current-channel" id="currentChannel"></span>
     <div class="spacer"></div>
     <nav class="view-tabs">
-      <button data-view="chat" class="active">Chat</button>
+      <button data-view="home" class="active">Home</button>
+      <button data-view="chat">Chat</button>
       <button data-view="search">Search</button>
       <button data-view="editlog">Edits</button>
+      <button data-view="bots">Bots</button>
     </nav>
     <button class="header-action" id="refreshBtn" title="Refresh (R)">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -779,6 +1029,58 @@
     <div class="modal-actions">
       <button id="modalCancel">Cancel</button>
       <button id="modalSave" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="bot-editor-overlay" id="botEditor">
+  <div class="bot-editor">
+    <div class="bot-editor-head">
+      <div>
+        <div class="title" id="botEditorTitle">Bot</div>
+        <div class="file" id="botEditorFile"></div>
+      </div>
+      <button class="close-x" id="botEditorClose" aria-label="Close">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div class="bot-editor-body">
+      <textarea class="bot-editor-textarea" id="botEditorTextarea" spellcheck="false"></textarea>
+    </div>
+    <div class="bot-editor-foot">
+      <div class="stats" id="botEditorStats">—</div>
+      <div class="buttons">
+        <button id="botBackupsBtn">Backups</button>
+        <button id="botRevertBtn">Revert</button>
+        <button id="botDiffBtn">Preview changes</button>
+        <button id="botApplyBtn" class="primary" disabled>Apply</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="diffModal">
+  <div class="modal">
+    <h3>Changes preview</h3>
+    <p class="tab-description">Review the diff before applying. The current file will be backed up automatically.</p>
+    <div class="diff-block" id="diffBlock"></div>
+    <div class="modal-actions">
+      <button id="diffCancel">Cancel</button>
+      <button id="diffApply" class="primary">Apply</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="backupsModal">
+  <div class="modal">
+    <h3>Backups</h3>
+    <p class="tab-description">Restore a previous version. A new backup is created before restoring.</p>
+    <div class="backup-list" id="backupList"></div>
+    <div class="modal-actions">
+      <button id="backupsClose">Close</button>
     </div>
   </div>
 </div>

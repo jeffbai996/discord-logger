@@ -17,6 +17,7 @@ const state = {
   fetching: false,
   pendingNewIds: new Set(), // ids seen since user last viewed bottom
   documentVisible: true,
+  botEditor: null,  // {id, original, lastMod} when open
 };
 
 const $ = sel => document.querySelector(sel);
@@ -469,6 +470,321 @@ async function loadEditLog() {
   }
 }
 
+// ---------- home dashboard ----------
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function renderSparkline(buckets) {
+  const max = Math.max(1, ...buckets);
+  const bars = buckets.map(v => {
+    const pct = Math.max(8, Math.round((v / max) * 100));
+    const cls = v === 0 ? 'bar empty' : 'bar';
+    return `<div class="${cls}" style="height: ${pct}%" title="${v}"></div>`;
+  }).join('');
+  return `<div class="sparkline">${bars}</div>`;
+}
+
+function renderDashCard(card) {
+  const preview = card.last_message
+    ? `<div class="dash-card-preview"><span class="prev-author">${esc(card.last_message.author)}:</span> ${esc(card.last_message.content || '(no text)')}</div>`
+    : `<div class="dash-card-preview">No messages yet.</div>`;
+  const lastTs = card.last_message ? parseTs(card.last_message.timestamp) : null;
+  const when = lastTs ? fmtRelativeOrShort(lastTs) : '—';
+  return `
+    <div class="dash-card" data-id="${esc(card.id)}">
+      <div class="dash-card-top">
+        <span class="dash-card-name">${esc(card.name)}</span>
+        <span class="dash-card-count">${card.count.toLocaleString()} msgs</span>
+      </div>
+      ${preview}
+      ${renderSparkline(card.activity)}
+      <div class="dash-card-meta">
+        <span class="size">${fmtBytes(card.size_bytes)}</span>
+        <span class="when">${esc(when)}</span>
+      </div>
+    </div>
+  `;
+}
+
+async function loadHome() {
+  setHtml($('#content'), renderSkeleton());
+  try {
+    const d = await api('/api/dashboard');
+    const t = d.totals;
+    const header = `
+      <div class="dash-header">
+        <h2>Overview</h2>
+        <div class="dash-totals">
+          <span><strong>${t.channels}</strong> channels</span>
+          <span><strong>${t.messages.toLocaleString()}</strong> messages</span>
+          <span><strong>${fmtBytes(t.log_bytes)}</strong> logs</span>
+          <span><strong>${fmtBytes(t.edits_bytes)}</strong> edits (${t.edits_count})</span>
+        </div>
+      </div>
+    `;
+    const grid = `<div class="card-grid">${d.cards.map(renderDashCard).join('')}</div>`;
+    setHtml($('#content'), header + grid);
+    $$('.dash-card').forEach(el => {
+      el.addEventListener('click', () => {
+        state.channelId = el.dataset.id;
+        state.pendingNewIds.clear();
+        state.lastMessages = [];
+        $$('.channel').forEach(c => c.classList.toggle('active', c.dataset.id === state.channelId));
+        updateCurrentChannelLabel();
+        setView('chat');
+      });
+    });
+  } catch (e) {
+    setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+  }
+}
+
+// ---------- bots ----------
+function renderBotCard(b) {
+  const lines = b.lines ? `${b.lines} lines` : '—';
+  const bytes = b.bytes ? fmtBytes(b.bytes) : '—';
+  const when = b.last_mod ? fmtRelativeOrShort(new Date(b.last_mod * 1000)) : '—';
+  const btnLabel = b.exists ? 'Edit' : 'Not found';
+  const disabled = b.exists && !b.too_large ? '' : 'disabled';
+  return `
+    <div class="bot-card" data-id="${esc(b.id)}">
+      <div class="bot-card-top">
+        <span class="bot-card-name">${esc(b.label)}</span>
+        <span class="bot-card-desc">${esc(b.description)}</span>
+      </div>
+      <div class="bot-card-file" title="${esc(b.file)}">${esc(b.file)}</div>
+      <div class="bot-card-meta">
+        <span>${bytes}</span>
+        <span>${lines}</span>
+        <span>${esc(when)}</span>
+      </div>
+      <button class="primary-btn" data-action="edit" ${disabled}>${btnLabel}</button>
+    </div>
+  `;
+}
+
+async function loadBots() {
+  setHtml($('#content'), renderSkeleton());
+  try {
+    const bots = await api('/api/bots');
+    const header = `
+      <div class="dash-header">
+        <h2>Bot personas</h2>
+        <div class="dash-totals">
+          <span>Edits are atomic with timestamped backups.</span>
+        </div>
+      </div>
+    `;
+    const grid = `<div class="bot-grid">${bots.map(renderBotCard).join('')}</div>`;
+    setHtml($('#content'), header + grid);
+    $$('.bot-card button[data-action="edit"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.closest('.bot-card').dataset.id;
+        openBotEditor(id);
+      });
+    });
+  } catch (e) {
+    setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+  }
+}
+
+// ---------- bot editor ----------
+async function openBotEditor(botId) {
+  state.botEditor = { id: botId, original: '', lastMod: null };
+  let b;
+  try {
+    b = await api(`/api/bots/${encodeURIComponent(botId)}`);
+  } catch (e) {
+    toast('Failed to load bot: ' + e.message, 'error');
+    return;
+  }
+  if (!b.exists) {
+    toast('Bot file not found on disk', 'error');
+    return;
+  }
+  if (b.too_large) {
+    toast('File exceeds 200KB safety cap; edit via shell', 'error');
+    return;
+  }
+  state.botEditor.original = b.content;
+  state.botEditor.lastMod = b.last_mod;
+  $('#botEditorTitle').textContent = b.label;
+  $('#botEditorFile').textContent = b.file;
+  $('#botEditorTextarea').value = b.content;
+  updateEditorStats();
+  $('#botApplyBtn').disabled = true;
+  $('#botEditor').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeBotEditor() {
+  $('#botEditor').classList.remove('open');
+  document.body.style.overflow = '';
+  state.botEditor = null;
+}
+
+function updateEditorStats() {
+  const ta = $('#botEditorTextarea');
+  const bytes = new TextEncoder().encode(ta.value).length;
+  const lines = ta.value.split('\n').length;
+  const dirty = state.botEditor && ta.value !== state.botEditor.original;
+  const dirtyTag = dirty ? ' <span style="color: var(--warn)">• modified</span>' : '';
+  $('#botEditorStats').innerHTML = `${bytes.toLocaleString()} bytes · ${lines} lines${dirtyTag}`;
+  $('#botApplyBtn').disabled = !dirty;
+  $('#botRevertBtn').disabled = !dirty;
+}
+
+function revertBotEdit() {
+  if (!state.botEditor) return;
+  $('#botEditorTextarea').value = state.botEditor.original;
+  updateEditorStats();
+}
+
+// Simple line-level diff (no LCS — just marks added/removed lines)
+function renderDiff(oldText, newText) {
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  // Use naive LCS via dynamic programming for readable diff
+  const n = oldLines.length, m = newLines.length;
+  const dp = Array.from({length: n + 1}, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (oldLines[i] === newLines[j]) dp[i][j] = dp[i+1][j+1] + 1;
+      else dp[i][j] = Math.max(dp[i+1][j], dp[i][j+1]);
+    }
+  }
+  let i = 0, j = 0, out = [];
+  while (i < n && j < m) {
+    if (oldLines[i] === newLines[j]) {
+      out.push({kind: 'ctx', line: oldLines[i]}); i++; j++;
+    } else if (dp[i+1][j] >= dp[i][j+1]) {
+      out.push({kind: 'del', line: oldLines[i]}); i++;
+    } else {
+      out.push({kind: 'add', line: newLines[j]}); j++;
+    }
+  }
+  while (i < n) { out.push({kind: 'del', line: oldLines[i++]}); }
+  while (j < m) { out.push({kind: 'add', line: newLines[j++]}); }
+
+  // Collapse long runs of ctx to keep the diff readable
+  const CONTEXT = 2;
+  const chunks = [];
+  let i2 = 0;
+  while (i2 < out.length) {
+    if (out[i2].kind !== 'ctx') { chunks.push(out[i2]); i2++; continue; }
+    // find run of ctx
+    let end = i2;
+    while (end < out.length && out[end].kind === 'ctx') end++;
+    const runLen = end - i2;
+    const isFirst = i2 === 0;
+    const isLast = end === out.length;
+    const keepStart = isFirst ? 0 : CONTEXT;
+    const keepEnd = isLast ? 0 : CONTEXT;
+    if (runLen <= keepStart + keepEnd + 1) {
+      for (let k = i2; k < end; k++) chunks.push(out[k]);
+    } else {
+      for (let k = i2; k < i2 + keepStart; k++) chunks.push(out[k]);
+      chunks.push({kind: 'elide', line: `⋯ ${runLen - keepStart - keepEnd} unchanged lines ⋯`});
+      for (let k = end - keepEnd; k < end; k++) chunks.push(out[k]);
+    }
+    i2 = end;
+  }
+
+  return chunks.map(c => {
+    if (c.kind === 'add') return `<div class="add">+ ${esc(c.line)}</div>`;
+    if (c.kind === 'del') return `<div class="del">- ${esc(c.line)}</div>`;
+    if (c.kind === 'elide') return `<div class="ctx" style="color:var(--text-faint); font-style: italic;">${esc(c.line)}</div>`;
+    return `<div class="ctx">  ${esc(c.line)}</div>`;
+  }).join('');
+}
+
+function previewBotDiff() {
+  if (!state.botEditor) return;
+  const diff = renderDiff(state.botEditor.original, $('#botEditorTextarea').value);
+  setHtml($('#diffBlock'), diff || '<em>No changes.</em>');
+  $('#diffModal').classList.add('open');
+}
+
+function closeDiff() {
+  $('#diffModal').classList.remove('open');
+}
+
+async function applyBotChanges() {
+  if (!state.botEditor) return;
+  const content = $('#botEditorTextarea').value;
+  try {
+    const res = await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/file`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({content}),
+    });
+    toast(`Saved (${fmtBytes(res.bytes)})`, 'success');
+    state.botEditor.original = content;
+    state.botEditor.lastMod = res.last_mod;
+    updateEditorStats();
+    closeDiff();
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+async function openBackupsModal() {
+  if (!state.botEditor) return;
+  $('#backupsModal').classList.add('open');
+  setHtml($('#backupList'), '<div class="empty-state">Loading...</div>');
+  try {
+    const list = await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/backups`);
+    if (!list.length) {
+      setHtml($('#backupList'), '<div class="empty-state">No backups yet.</div>');
+      return;
+    }
+    setHtml($('#backupList'), list.map(b => {
+      const when = fmtRelativeOrShort(new Date(b.ts * 1000));
+      return `<div class="backup-item" data-name="${esc(b.name)}">
+        <div>
+          <div class="bk-name">${esc(b.name)}</div>
+          <div style="color: var(--text-faint); font-size: 11.5px;">${fmtBytes(b.bytes)} · ${esc(when)}</div>
+        </div>
+        <button data-action="restore">Restore</button>
+      </div>`;
+    }).join(''));
+    $$('#backupList button[data-action="restore"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const name = btn.closest('.backup-item').dataset.name;
+        restoreBackup(name);
+      });
+    });
+  } catch (e) {
+    setHtml($('#backupList'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+  }
+}
+
+function closeBackupsModal() {
+  $('#backupsModal').classList.remove('open');
+}
+
+async function restoreBackup(name) {
+  if (!state.botEditor) return;
+  if (!confirm(`Restore from ${name}? Current content will be backed up first.`)) return;
+  try {
+    await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/restore`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name}),
+    });
+    toast('Restored', 'success');
+    closeBackupsModal();
+    // reload editor content
+    openBotEditor(state.botEditor.id);
+  } catch (e) {
+    toast('Restore failed: ' + e.message, 'error');
+  }
+}
+
 // ---------- view switching ----------
 function setView(view) {
   state.view = view;
@@ -480,18 +796,22 @@ function setView(view) {
   } else {
     stopLivePolling();
   }
-  if (view === 'search') {
+  if (view === 'home') loadHome();
+  else if (view === 'search') {
     if ($('#searchQ').value || $('#searchAuthor').value) runSearch();
     else setHtml($('#content'), '<div class="empty-state">Enter a pattern and hit Search.</div>');
     setTimeout(() => $('#searchQ').focus(), 50);
   }
   else if (view === 'editlog') loadEditLog();
+  else if (view === 'bots') loadBots();
 }
 
 function refreshCurrent() {
-  if (state.view === 'chat') loadChat();
+  if (state.view === 'home') loadHome();
+  else if (state.view === 'chat') loadChat();
   else if (state.view === 'search') runSearch();
   else if (state.view === 'editlog') loadEditLog();
+  else if (state.view === 'bots') loadBots();
   loadChannels();
 }
 
@@ -616,9 +936,33 @@ async function saveEdit() {
 // ---------- init ----------
 document.addEventListener('DOMContentLoaded', () => {
   loadChannels();
+  setView('home');  // default landing
 
   $$('.view-tabs button').forEach(b => {
     b.addEventListener('click', () => setView(b.dataset.view));
+  });
+
+  // Bot editor
+  $('#botEditorTextarea').addEventListener('input', updateEditorStats);
+  $('#botEditorClose').addEventListener('click', () => {
+    if (state.botEditor) {
+      const ta = $('#botEditorTextarea');
+      if (ta.value !== state.botEditor.original && !confirm('Discard unsaved changes?')) return;
+    }
+    closeBotEditor();
+  });
+  $('#botRevertBtn').addEventListener('click', revertBotEdit);
+  $('#botDiffBtn').addEventListener('click', previewBotDiff);
+  $('#botApplyBtn').addEventListener('click', previewBotDiff);  // apply goes through diff preview
+  $('#botBackupsBtn').addEventListener('click', openBackupsModal);
+  $('#diffCancel').addEventListener('click', closeDiff);
+  $('#diffApply').addEventListener('click', applyBotChanges);
+  $('#diffModal').addEventListener('click', e => {
+    if (e.target.id === 'diffModal') closeDiff();
+  });
+  $('#backupsClose').addEventListener('click', closeBackupsModal);
+  $('#backupsModal').addEventListener('click', e => {
+    if (e.target.id === 'backupsModal') closeBackupsModal();
   });
 
   $('#searchGo').addEventListener('click', runSearch);
@@ -665,7 +1009,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
-      if ($('#editModal').classList.contains('open')) closeModal();
+      if ($('#diffModal').classList.contains('open')) closeDiff();
+      else if ($('#backupsModal').classList.contains('open')) closeBackupsModal();
+      else if ($('#editModal').classList.contains('open')) closeModal();
+      else if ($('#botEditor').classList.contains('open')) {
+        if (state.botEditor) {
+          const ta = $('#botEditorTextarea');
+          if (ta.value !== state.botEditor.original && !confirm('Discard unsaved changes?')) return;
+        }
+        closeBotEditor();
+      }
       else if (state.sidebarOpen) closeSidebar();
     }
     // Keyboard shortcuts only when not in a text field
