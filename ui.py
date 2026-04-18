@@ -9,6 +9,7 @@ timestamped backups in state/bot_backups/ kept last 10 per bot.
 Runs on http://0.0.0.0:5050. Intended for Tailscale access only.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -93,7 +94,14 @@ BOT_BY_ID = {b["id"]: b for b in BOTS}
 MAX_BOT_FILE_BYTES = 200 * 1024  # 200 KB
 MAX_BACKUPS_PER_BOT = 10
 
+# Upper bound on `limit` query params across list endpoints. Stops a caller
+# from asking for enough rows to OOM the server.
+MAX_QUERY_LIMIT = 500
+
 app = Flask(__name__)
+# Reject oversized request bodies at the WSGI layer before we allocate for
+# them. 512KB comfortably covers a 200KB persona/memory edit plus JSON framing.
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024
 
 # Simple mtime-based cache for edits. Reloaded on disk change or POST.
 _edits_cache: dict[str, list[dict]] = {}
@@ -326,9 +334,20 @@ def api_dashboard():
     })
 
 
+def _clamp_limit(raw: Optional[str], default: int) -> int:
+    """Parse a ?limit= query param, clamped to [1, MAX_QUERY_LIMIT]."""
+    try:
+        n = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        n = default
+    if n < 1:
+        n = 1
+    return min(n, MAX_QUERY_LIMIT)
+
+
 @app.route("/api/messages/<channel_id>")
 def api_messages(channel_id: str):
-    limit = int(request.args.get("limit", 200))
+    limit = _clamp_limit(request.args.get("limit"), 200)
     before = request.args.get("before") or None
     return jsonify(read_channel(channel_id, limit=limit, before=before))
 
@@ -338,7 +357,7 @@ def api_search():
     q = request.args.get("q", "").strip()
     channel = request.args.get("channel", "").strip()
     author = request.args.get("author", "").strip()
-    limit = int(request.args.get("limit", 100))
+    limit = _clamp_limit(request.args.get("limit"), 100)
     show_deleted = request.args.get("show_deleted") == "1"
 
     if not q and not author:
@@ -427,8 +446,18 @@ def api_edits():
         entry["value"] = data.get("value", "")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(EDITS_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Hold an exclusive flock on a sibling file for the duration of the append.
+    # Prevents interleaved partial lines from concurrent POSTs — single-user but
+    # double-click Apply is enough to race. The lock file is cheap to leave
+    # around; we keep it open only for the critical section.
+    lock_path = STATE_DIR / "edits.lock"
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        with open(EDITS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
 
     _edits_mtime = 0.0
     log.info("Recorded edit: %s on %s", action, msg_id)
