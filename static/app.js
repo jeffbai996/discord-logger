@@ -17,7 +17,10 @@ const state = {
   fetching: false,
   pendingNewIds: new Set(), // ids seen since user last viewed bottom
   documentVisible: true,
-  botEditor: null,  // {id, original, lastMod} when open
+  // File editor state — shared between Bots and Squad tabs.
+  // scope is 'bots' or 'squad'; kind hints the UI (e.g. 'json' enables JSON
+  // validation); label/file are cached for reload paths.
+  botEditor: null,  // {scope, id, kind, label, file, original, lastMod}
 };
 
 const $ = sel => document.querySelector(sel);
@@ -592,24 +595,169 @@ async function loadBots() {
   }
 }
 
-// ---------- bot editor ----------
-async function openBotEditor(botId) {
-  state.botEditor = { id: botId, original: '', lastMod: null };
+// ---------- squad ----------
+function renderSquadCard(e, actions) {
+  // actions is the inner HTML for the button row — ownership varies by kind.
+  const lines = e.lines ? `${e.lines} lines` : '—';
+  const bytes = e.bytes ? fmtBytes(e.bytes) : '—';
+  const when = e.last_mod ? fmtRelativeOrShort(new Date(e.last_mod * 1000)) : '—';
+  const label = e.label || e.id;
+  return `
+    <div class="bot-card" data-id="${esc(e.id)}">
+      <div class="bot-card-top">
+        <span class="bot-card-name">${esc(label)}</span>
+        <span class="bot-card-desc">${esc(e.kind || '')}</span>
+      </div>
+      <div class="bot-card-file" title="${esc(e.file)}">${esc(e.file)}</div>
+      <div class="bot-card-meta">
+        <span>${bytes}</span>
+        <span>${lines}</span>
+        <span>${esc(when)}</span>
+      </div>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">${actions}</div>
+    </div>
+  `;
+}
+
+async function loadSquad() {
+  setHtml($('#content'), renderSkeleton());
+  try {
+    const data = await api('/api/squad');
+    const entries = data.entries || [];
+    const config = entries.find(e => e.id === 'squad-config');
+    const memories = entries.filter(e => e.id !== 'squad-config');
+
+    const configCard = config
+      ? renderSquadCard(config, `<button class="primary-btn" data-action="edit">Edit</button>`)
+      : '';
+
+    const memoryCards = memories.map(m => renderSquadCard(m, `
+      <button class="primary-btn" data-action="edit">Edit</button>
+      <button class="primary-btn" data-action="delete" style="background: var(--danger-soft); color: var(--danger);">Delete</button>
+    `)).join('');
+
+    const newCard = `
+      <div class="bot-card" style="border-style: dashed; align-items: center; justify-content: center; text-align: center; cursor: pointer;" id="newMemoryCard">
+        <span style="font-size: 22px; color: var(--accent);">+</span>
+        <span class="bot-card-name">New memory</span>
+        <span class="bot-card-desc">Create a shared memory file</span>
+      </div>
+    `;
+
+    const html = `
+      <div class="dash-header">
+        <h2>Squad shared context</h2>
+        <div class="dash-totals">
+          <span>${esc(data.squad_dir)} — edits atomic with backups.</span>
+        </div>
+      </div>
+      <h3 style="margin: 16px 0 8px; color: var(--text-dim); font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;">Squad config</h3>
+      <div class="bot-grid">${configCard}</div>
+      <h3 style="margin: 24px 0 8px; color: var(--text-dim); font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;">Shared memories</h3>
+      <div class="bot-grid">${memoryCards}${newCard}</div>
+    `;
+    setHtml($('#content'), html);
+
+    $$('.bot-card button[data-action="edit"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.closest('.bot-card').dataset.id;
+        openFileEditor('squad', id);
+      });
+    });
+    $$('.bot-card button[data-action="delete"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.closest('.bot-card').dataset.id;
+        softDeleteMemory(id);
+      });
+    });
+    const newCardEl = $('#newMemoryCard');
+    if (newCardEl) newCardEl.addEventListener('click', openNewMemoryModal);
+  } catch (e) {
+    setHtml($('#content'), `<div class="empty-state">Error: ${esc(e.message)}</div>`);
+  }
+}
+
+async function softDeleteMemory(entryId) {
+  if (!entryId.startsWith('mem:')) return;
+  const stem = entryId.slice(4);
+  if (!confirm(`Soft-delete memory '${stem}.md'? The file is renamed, not destroyed — you can restore it via shell by renaming back.`)) return;
+  try {
+    await api(`/api/squad/memories/${encodeURIComponent(stem)}/delete`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    toast('Memory soft-deleted', 'success');
+    loadSquad();
+  } catch (e) {
+    toast('Delete failed: ' + e.message, 'error');
+  }
+}
+
+function openNewMemoryModal() {
+  $('#newMemoryName').value = '';
+  $('#newMemoryContent').value = '';
+  $('#newMemoryModal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => $('#newMemoryName').focus(), 50);
+}
+
+function closeNewMemoryModal() {
+  $('#newMemoryModal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+async function createNewMemory() {
+  const name = $('#newMemoryName').value.trim();
+  const content = $('#newMemoryContent').value;
+  if (!/^[a-z0-9_-]+$/.test(name)) {
+    toast('Name must be lowercase letters, digits, _ or - (no extension)', 'error');
+    return;
+  }
+  try {
+    const res = await api('/api/squad/memories', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, content}),
+    });
+    toast('Memory created', 'success');
+    closeNewMemoryModal();
+    loadSquad();
+    // Jump straight into the editor for the newly created file.
+    openFileEditor('squad', res.id);
+  } catch (e) {
+    toast('Create failed: ' + e.message, 'error');
+  }
+}
+
+// ---------- file editor (shared: bots + squad) ----------
+// Per-scope API path prefix. 'bots' entries are identified by plain ids;
+// 'squad' entries use composite ids like 'squad-config' or 'mem:<stem>' so
+// the path template is identical — `/api/<scope>/<id>` etc.
+function editorBase(scope, id) {
+  return `/api/${scope}/${encodeURIComponent(id)}`;
+}
+
+async function openFileEditor(scope, id) {
+  state.botEditor = { scope, id, kind: null, label: '', file: '', original: '', lastMod: null };
   let b;
   try {
-    b = await api(`/api/bots/${encodeURIComponent(botId)}`);
+    b = await api(editorBase(scope, id));
   } catch (e) {
-    toast('Failed to load bot: ' + e.message, 'error');
+    toast('Failed to load file: ' + e.message, 'error');
     return;
   }
   if (!b.exists) {
-    toast('Bot file not found on disk', 'error');
+    toast('File not found on disk', 'error');
     return;
   }
   if (b.too_large) {
     toast('File exceeds 200KB safety cap; edit via shell', 'error');
     return;
   }
+  state.botEditor.kind = b.kind || null;
+  state.botEditor.label = b.label;
+  state.botEditor.file = b.file;
   state.botEditor.original = b.content;
   state.botEditor.lastMod = b.last_mod;
   $('#botEditorTitle').textContent = b.label;
@@ -620,6 +768,9 @@ async function openBotEditor(botId) {
   $('#botEditor').classList.add('open');
   document.body.style.overflow = 'hidden';
 }
+
+// Back-compat wrapper for Bots tab callers.
+function openBotEditor(botId) { return openFileEditor('bots', botId); }
 
 function closeBotEditor() {
   $('#botEditor').classList.remove('open');
@@ -632,9 +783,32 @@ function updateEditorStats() {
   const bytes = new TextEncoder().encode(ta.value).length;
   const lines = ta.value.split('\n').length;
   const dirty = state.botEditor && ta.value !== state.botEditor.original;
-  const dirtyTag = dirty ? ' <span style="color: var(--warn)">• modified</span>' : '';
-  $('#botEditorStats').innerHTML = `${bytes.toLocaleString()} bytes · ${lines} lines${dirtyTag}`;
-  $('#botApplyBtn').disabled = !dirty;
+
+  // Rebuild stats via DOM ops (not innerHTML) since the JSON validator message
+  // surfaces parser-generated text — safer to never route it through HTML.
+  const stats = $('#botEditorStats');
+  stats.textContent = `${bytes.toLocaleString()} bytes · ${lines} lines`;
+  if (dirty) {
+    const mod = document.createElement('span');
+    mod.style.color = 'var(--warn)';
+    mod.textContent = ' • modified';
+    stats.appendChild(mod);
+  }
+  let jsonInvalid = false;
+  if (state.botEditor && state.botEditor.kind === 'json') {
+    const tag = document.createElement('span');
+    try {
+      JSON.parse(ta.value);
+      tag.style.color = 'var(--success)';
+      tag.textContent = ' • valid JSON';
+    } catch (e) {
+      jsonInvalid = true;
+      tag.style.color = 'var(--danger)';
+      tag.textContent = ` • invalid JSON: ${e.message}`;
+    }
+    stats.appendChild(tag);
+  }
+  $('#botApplyBtn').disabled = !dirty || jsonInvalid;
   $('#botRevertBtn').disabled = !dirty;
 }
 
@@ -715,9 +889,10 @@ function closeDiff() {
 
 async function applyBotChanges() {
   if (!state.botEditor) return;
+  const {scope, id} = state.botEditor;
   const content = $('#botEditorTextarea').value;
   try {
-    const res = await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/file`, {
+    const res = await api(`${editorBase(scope, id)}/file`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({content}),
@@ -734,10 +909,11 @@ async function applyBotChanges() {
 
 async function openBackupsModal() {
   if (!state.botEditor) return;
+  const {scope, id} = state.botEditor;
   $('#backupsModal').classList.add('open');
   setHtml($('#backupList'), '<div class="empty-state">Loading...</div>');
   try {
-    const list = await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/backups`);
+    const list = await api(`${editorBase(scope, id)}/backups`);
     if (!list.length) {
       setHtml($('#backupList'), '<div class="empty-state">No backups yet.</div>');
       return;
@@ -769,17 +945,17 @@ function closeBackupsModal() {
 
 async function restoreBackup(name) {
   if (!state.botEditor) return;
+  const {scope, id} = state.botEditor;
   if (!confirm(`Restore from ${name}? Current content will be backed up first.`)) return;
   try {
-    await api(`/api/bots/${encodeURIComponent(state.botEditor.id)}/restore`, {
+    await api(`${editorBase(scope, id)}/restore`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name}),
     });
     toast('Restored', 'success');
     closeBackupsModal();
-    // reload editor content
-    openBotEditor(state.botEditor.id);
+    openFileEditor(scope, id);
   } catch (e) {
     toast('Restore failed: ' + e.message, 'error');
   }
@@ -804,6 +980,7 @@ function setView(view) {
   }
   else if (view === 'editlog') loadEditLog();
   else if (view === 'bots') loadBots();
+  else if (view === 'squad') loadSquad();
 }
 
 function refreshCurrent() {
@@ -812,6 +989,7 @@ function refreshCurrent() {
   else if (state.view === 'search') runSearch();
   else if (state.view === 'editlog') loadEditLog();
   else if (state.view === 'bots') loadBots();
+  else if (state.view === 'squad') loadSquad();
   loadChannels();
 }
 
@@ -963,6 +1141,16 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#backupsClose').addEventListener('click', closeBackupsModal);
   $('#backupsModal').addEventListener('click', e => {
     if (e.target.id === 'backupsModal') closeBackupsModal();
+  });
+
+  // New-memory modal (Squad tab)
+  $('#newMemoryCancel').addEventListener('click', closeNewMemoryModal);
+  $('#newMemoryCreate').addEventListener('click', createNewMemory);
+  $('#newMemoryModal').addEventListener('click', e => {
+    if (e.target.id === 'newMemoryModal') closeNewMemoryModal();
+  });
+  $('#newMemoryName').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); $('#newMemoryContent').focus(); }
   });
 
   $('#searchGo').addEventListener('click', runSearch);

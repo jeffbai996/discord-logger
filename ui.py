@@ -35,7 +35,18 @@ LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "./state"))
 EDITS_FILE = STATE_DIR / "edits.jsonl"
 BOT_BACKUP_DIR = STATE_DIR / "bot_backups"
+SQUAD_BACKUP_DIR = STATE_DIR / "squad_backups"
 PORT = int(os.getenv("UI_PORT", "5050"))
+
+# Squad shared context — files any bot reads on boot. Paths default to fragserv
+# layout; override via SQUAD_DIR for local testing against a fixture tree.
+SQUAD_DIR = Path(os.getenv("SQUAD_DIR", "/home/jbai/claude-agents/shared/squad-context"))
+SQUAD_MEMORIES_DIR = SQUAD_DIR / "memories"
+SQUAD_CONFIG_FILE = SQUAD_DIR / "squad-config.json"
+MAX_SQUAD_FILE_BYTES = 200 * 1024
+MAX_SQUAD_BACKUPS = 10
+# Memory filename stem: lowercase, digits, underscore, hyphen.
+MEMORY_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 # Human-readable channel names — keep in sync with summarise_channels.py
 CHANNEL_NAMES = {
@@ -426,6 +437,73 @@ def api_edits():
 
 # ---------- Bot persona editor ----------
 
+# ---------- Generic atomic-write / backup primitives ----------
+# Used by bot-persona edits (BOT_BACKUP_DIR) and squad-context edits
+# (SQUAD_BACKUP_DIR). Backup filenames are `<prefix>.<ts>.bak`, pruned to
+# `max_keep` newest.
+
+def _backup_timestamp() -> str:
+    # GMT second-resolution plus a 6-digit microsecond tag avoids collisions
+    # on rapid successive writes.
+    return time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{int(time.time() * 1e6) % 1_000_000:06d}"
+
+
+def _atomic_write(target: Path, encoded: bytes) -> None:
+    """Write bytes to `target` atomically via tmp-in-same-dir + os.replace.
+
+    Callers must have already validated size / path. Raises on any failure and
+    cleans up the tmp file.
+    """
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        tmp.write_bytes(encoded)
+        os.replace(tmp, target)
+    except Exception:
+        if tmp.exists():
+            try: tmp.unlink()
+            except Exception: pass
+        raise
+
+
+def _backup_file(target: Path, backup_dir: Path, prefix: str) -> Optional[Path]:
+    """Copy `target` into `backup_dir` as `<prefix>.<ts>.bak`. No-op if target missing."""
+    if not target.exists():
+        return None
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{prefix}.{_backup_timestamp()}.bak"
+    backup_path.write_bytes(target.read_bytes())
+    return backup_path
+
+
+def _prune_backups_for(backup_dir: Path, prefix: str, max_keep: int) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(backup_dir.glob(f"{prefix}.*.bak"), reverse=True)
+    for old in files[max_keep:]:
+        try:
+            old.unlink()
+        except Exception as e:
+            log.warning("prune backup %s: %s", old, e)
+
+
+def _list_backups_for(backup_dir: Path, prefix: str) -> list[dict]:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(backup_dir.glob(f"{prefix}.*.bak"), reverse=True)
+    return [
+        {"name": f.name, "bytes": f.stat().st_size, "ts": f.stat().st_mtime}
+        for f in files
+    ]
+
+
+def _validate_backup_name(name: str, prefix: str) -> bool:
+    """Guard restore inputs against path traversal and prefix spoofing."""
+    return (
+        name.startswith(f"{prefix}.")
+        and name.endswith(".bak")
+        and "/" not in name
+        and ".." not in name
+    )
+
+
 def _bot_meta(bot: dict) -> dict:
     """Return live file metadata for a bot."""
     p = Path(bot["file"])
@@ -480,34 +558,11 @@ def api_bot_detail(bot_id: str):
     return jsonify(_bot_meta(bot))
 
 
-def _list_backups(bot_id: str) -> list[dict]:
-    BOT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    pattern = f"{bot_id}.*.bak"
-    files = sorted(BOT_BACKUP_DIR.glob(pattern), reverse=True)
-    return [
-        {
-            "name": f.name,
-            "bytes": f.stat().st_size,
-            "ts": f.stat().st_mtime,
-        }
-        for f in files
-    ]
-
-
-def _prune_backups(bot_id: str) -> None:
-    files = sorted(BOT_BACKUP_DIR.glob(f"{bot_id}.*.bak"), reverse=True)
-    for old in files[MAX_BACKUPS_PER_BOT:]:
-        try:
-            old.unlink()
-        except Exception as e:
-            log.warning("prune backup %s: %s", old, e)
-
-
 @app.route("/api/bots/<bot_id>/backups")
 def api_bot_backups(bot_id: str):
     if bot_id not in BOT_BY_ID:
         return jsonify({"error": "unknown bot"}), 404
-    return jsonify(_list_backups(bot_id))
+    return jsonify(_list_backups_for(BOT_BACKUP_DIR, bot_id))
 
 
 @app.route("/api/bots/<bot_id>/file", methods=["POST"])
@@ -531,33 +586,23 @@ def api_bot_write(bot_id: str):
     if not target.parent.exists():
         return jsonify({"error": "target directory does not exist"}), 500
 
-    # Backup existing file (if any) to state/bot_backups/<bot_id>.<ts>.bak
-    BOT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts_tag = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{int(time.time() * 1e6) % 1_000_000:06d}"
-    backup_name = BOT_BACKUP_DIR / f"{bot_id}.{ts_tag}.bak"
-    if target.exists():
-        try:
-            backup_name.write_bytes(target.read_bytes())
-        except Exception as e:
-            return jsonify({"error": f"backup failed: {e}"}), 500
-
-    # Atomic write — write to tmp in same dir, then rename on top
-    tmp = target.with_suffix(target.suffix + ".tmp")
     try:
-        tmp.write_bytes(encoded)
-        os.replace(tmp, target)
+        backup_path = _backup_file(target, BOT_BACKUP_DIR, bot_id)
     except Exception as e:
-        if tmp.exists():
-            try: tmp.unlink()
-            except Exception: pass
+        return jsonify({"error": f"backup failed: {e}"}), 500
+
+    try:
+        _atomic_write(target, encoded)
+    except Exception as e:
         return jsonify({"error": f"write failed: {e}"}), 500
 
-    _prune_backups(bot_id)
-    log.info("Wrote bot file: %s (%d bytes, backup=%s)", target, len(encoded), backup_name.name)
+    _prune_backups_for(BOT_BACKUP_DIR, bot_id, MAX_BACKUPS_PER_BOT)
+    backup_name = backup_path.name if backup_path else None
+    log.info("Wrote bot file: %s (%d bytes, backup=%s)", target, len(encoded), backup_name)
     return jsonify({
         "ok": True,
         "bytes": len(encoded),
-        "backup": backup_name.name,
+        "backup": backup_name,
         "last_mod": target.stat().st_mtime,
     })
 
@@ -571,8 +616,7 @@ def api_bot_restore(bot_id: str):
 
     data = request.get_json(force=True, silent=True) or {}
     name = data.get("name", "")
-    # Validate backup name belongs to this bot and no path traversal
-    if not name.startswith(f"{bot_id}.") or not name.endswith(".bak") or "/" in name or ".." in name:
+    if not _validate_backup_name(name, bot_id):
         return jsonify({"error": "invalid backup name"}), 400
 
     backup_path = BOT_BACKUP_DIR / name
@@ -580,21 +624,265 @@ def api_bot_restore(bot_id: str):
         return jsonify({"error": "backup not found"}), 404
 
     target = Path(bot["file"])
-    # Snapshot current as a pre-restore backup so restore itself is reversible
-    ts_tag = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{int(time.time() * 1e6) % 1_000_000:06d}"
-    pre_backup = BOT_BACKUP_DIR / f"{bot_id}.{ts_tag}.bak"
     try:
-        if target.exists():
-            pre_backup.write_bytes(target.read_bytes())
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_bytes(backup_path.read_bytes())
-        os.replace(tmp, target)
+        pre_backup = _backup_file(target, BOT_BACKUP_DIR, bot_id)
+        _atomic_write(target, backup_path.read_bytes())
     except Exception as e:
         return jsonify({"error": f"restore failed: {e}"}), 500
 
-    _prune_backups(bot_id)
+    _prune_backups_for(BOT_BACKUP_DIR, bot_id, MAX_BACKUPS_PER_BOT)
     log.info("Restored %s from %s", target, name)
-    return jsonify({"ok": True, "pre_backup": pre_backup.name})
+    return jsonify({"ok": True, "pre_backup": pre_backup.name if pre_backup else None})
+
+
+# ---------- Squad shared context ----------
+# Two kinds of entries:
+#   - squad-config:   fixed JSON file, schema-validated on write
+#   - mem:<stem>:     markdown files in SQUAD_MEMORIES_DIR, free-form
+# Backups share state/squad_backups/, prefixed `squad-config` or `mem-<stem>`,
+# pruned to MAX_SQUAD_BACKUPS per prefix.
+#
+# Soft-delete renames a memory to `<name>.md.deleted-<ts>`; bots glob `*.md`
+# so the file stops being read but stays on disk and can be un-renamed.
+
+def _memory_backup_prefix(stem: str) -> str:
+    return f"mem-{stem}"
+
+
+def _squad_entry_meta(entry_id: str, path: Path, label: str, kind: str) -> dict:
+    exists = path.exists()
+    bytes_size = 0
+    lines = 0
+    last_mod = None
+    content = None
+    if exists:
+        try:
+            stat = path.stat()
+            bytes_size = stat.st_size
+            last_mod = stat.st_mtime
+            if bytes_size <= MAX_SQUAD_FILE_BYTES:
+                content = path.read_text(encoding="utf-8")
+                lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+        except Exception as e:
+            log.warning("Failed to read squad file %s: %s", path, e)
+    return {
+        "id": entry_id,
+        "label": label,
+        "kind": kind,
+        "file": str(path),
+        "exists": exists,
+        "bytes": bytes_size,
+        "lines": lines,
+        "last_mod": last_mod,
+        "content": content,
+        "too_large": bytes_size > MAX_SQUAD_FILE_BYTES,
+    }
+
+
+def _list_memory_entries() -> list[dict]:
+    """Enumerate live memory files (excludes *.md.deleted-* soft-deletes)."""
+    if not SQUAD_MEMORIES_DIR.exists():
+        return []
+    entries = []
+    for p in sorted(SQUAD_MEMORIES_DIR.glob("*.md")):
+        stem = p.stem  # filename without .md
+        entries.append(_squad_entry_meta(f"mem:{stem}", p, stem, "markdown"))
+    return entries
+
+
+def _resolve_squad_entry(entry_id: str) -> Optional[tuple[Path, str, str, str]]:
+    """Return (path, label, kind, backup_prefix) for a squad entry_id, or None."""
+    if entry_id == "squad-config":
+        return (SQUAD_CONFIG_FILE, "squad-config.json", "json", "squad-config")
+    if entry_id.startswith("mem:"):
+        stem = entry_id[4:]
+        if not MEMORY_NAME_RE.match(stem):
+            return None
+        path = SQUAD_MEMORIES_DIR / f"{stem}.md"
+        return (path, stem, "markdown", _memory_backup_prefix(stem))
+    return None
+
+
+@app.route("/api/squad")
+def api_squad():
+    """List squad-context editable entries: squad-config + all live memories."""
+    entries = []
+    cfg = _squad_entry_meta("squad-config", SQUAD_CONFIG_FILE, "squad-config.json", "json")
+    cfg.pop("content", None)
+    entries.append(cfg)
+    for m in _list_memory_entries():
+        m.pop("content", None)
+        entries.append(m)
+    return jsonify({
+        "squad_dir": str(SQUAD_DIR),
+        "memories_dir": str(SQUAD_MEMORIES_DIR),
+        "entries": entries,
+    })
+
+
+@app.route("/api/squad/<path:entry_id>")
+def api_squad_detail(entry_id: str):
+    resolved = _resolve_squad_entry(entry_id)
+    if not resolved:
+        return jsonify({"error": "unknown entry"}), 404
+    path, label, kind, _prefix = resolved
+    return jsonify(_squad_entry_meta(entry_id, path, label, kind))
+
+
+@app.route("/api/squad/<path:entry_id>/backups")
+def api_squad_backups(entry_id: str):
+    resolved = _resolve_squad_entry(entry_id)
+    if not resolved:
+        return jsonify({"error": "unknown entry"}), 404
+    _path, _label, _kind, prefix = resolved
+    return jsonify(_list_backups_for(SQUAD_BACKUP_DIR, prefix))
+
+
+@app.route("/api/squad/<path:entry_id>/file", methods=["POST"])
+def api_squad_write(entry_id: str):
+    """Overwrite a squad-context file atomically, with a backup.
+
+    For kind=json, content is parsed via json.loads before write; parse errors
+    return 400 with the parser's message so the UI can surface it.
+    """
+    resolved = _resolve_squad_entry(entry_id)
+    if not resolved:
+        return jsonify({"error": "unknown entry"}), 404
+    target, _label, kind, prefix = resolved
+
+    data = request.get_json(force=True, silent=True) or {}
+    content = data.get("content")
+    if not isinstance(content, str):
+        return jsonify({"error": "content (string) required"}), 400
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_SQUAD_FILE_BYTES:
+        return jsonify({
+            "error": f"content too large ({len(encoded)} > {MAX_SQUAD_FILE_BYTES} bytes)",
+        }), 400
+
+    if kind == "json":
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            return jsonify({"error": f"invalid JSON: {e}"}), 400
+
+    if not target.parent.exists():
+        return jsonify({"error": "target directory does not exist"}), 500
+
+    try:
+        backup_path = _backup_file(target, SQUAD_BACKUP_DIR, prefix)
+    except Exception as e:
+        return jsonify({"error": f"backup failed: {e}"}), 500
+
+    try:
+        _atomic_write(target, encoded)
+    except Exception as e:
+        return jsonify({"error": f"write failed: {e}"}), 500
+
+    _prune_backups_for(SQUAD_BACKUP_DIR, prefix, MAX_SQUAD_BACKUPS)
+    backup_name = backup_path.name if backup_path else None
+    log.info("Wrote squad file: %s (%d bytes, backup=%s)", target, len(encoded), backup_name)
+    return jsonify({
+        "ok": True,
+        "bytes": len(encoded),
+        "backup": backup_name,
+        "last_mod": target.stat().st_mtime,
+    })
+
+
+@app.route("/api/squad/<path:entry_id>/restore", methods=["POST"])
+def api_squad_restore(entry_id: str):
+    resolved = _resolve_squad_entry(entry_id)
+    if not resolved:
+        return jsonify({"error": "unknown entry"}), 404
+    target, _label, _kind, prefix = resolved
+
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name", "")
+    if not _validate_backup_name(name, prefix):
+        return jsonify({"error": "invalid backup name"}), 400
+
+    backup_path = SQUAD_BACKUP_DIR / name
+    if not backup_path.exists():
+        return jsonify({"error": "backup not found"}), 404
+
+    try:
+        pre_backup = _backup_file(target, SQUAD_BACKUP_DIR, prefix)
+        _atomic_write(target, backup_path.read_bytes())
+    except Exception as e:
+        return jsonify({"error": f"restore failed: {e}"}), 500
+
+    _prune_backups_for(SQUAD_BACKUP_DIR, prefix, MAX_SQUAD_BACKUPS)
+    log.info("Restored squad %s from %s", target, name)
+    return jsonify({"ok": True, "pre_backup": pre_backup.name if pre_backup else None})
+
+
+@app.route("/api/squad/memories", methods=["POST"])
+def api_squad_memory_create():
+    """Create a new memory file in SQUAD_MEMORIES_DIR.
+
+    Body: {name: "<stem>", content?: "<markdown>"} — stem must match
+    MEMORY_NAME_RE, must not already exist. `.md` is appended automatically.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    content = data.get("content", "")
+    if not isinstance(content, str):
+        return jsonify({"error": "content (string) required"}), 400
+    if not MEMORY_NAME_RE.match(name):
+        return jsonify({
+            "error": "name must match [a-z0-9_-]+ (no extension, no path separators)",
+        }), 400
+
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_SQUAD_FILE_BYTES:
+        return jsonify({
+            "error": f"content too large ({len(encoded)} > {MAX_SQUAD_FILE_BYTES} bytes)",
+        }), 400
+
+    SQUAD_MEMORIES_DIR.mkdir(parents=True, exist_ok=True)
+    target = SQUAD_MEMORIES_DIR / f"{name}.md"
+    if target.exists():
+        return jsonify({"error": "memory already exists"}), 409
+
+    try:
+        _atomic_write(target, encoded)
+    except Exception as e:
+        return jsonify({"error": f"write failed: {e}"}), 500
+
+    log.info("Created memory: %s (%d bytes)", target, len(encoded))
+    return jsonify({
+        "ok": True,
+        "id": f"mem:{name}",
+        "file": str(target),
+        "bytes": len(encoded),
+        "last_mod": target.stat().st_mtime,
+    })
+
+
+@app.route("/api/squad/memories/<stem>/delete", methods=["POST"])
+def api_squad_memory_soft_delete(stem: str):
+    """Soft-delete a memory by renaming to `<name>.md.deleted-<ts>`.
+
+    The file stays on disk (bots glob `*.md` so it's out of rotation) and can
+    be restored by renaming back. No backup is taken — the file itself is the
+    archive.
+    """
+    if not MEMORY_NAME_RE.match(stem):
+        return jsonify({"error": "invalid memory name"}), 400
+    target = SQUAD_MEMORIES_DIR / f"{stem}.md"
+    if not target.exists():
+        return jsonify({"error": "memory not found"}), 404
+
+    deleted_name = f"{stem}.md.deleted-{_backup_timestamp()}"
+    deleted_path = SQUAD_MEMORIES_DIR / deleted_name
+    try:
+        target.rename(deleted_path)
+    except Exception as e:
+        return jsonify({"error": f"delete failed: {e}"}), 500
+
+    log.info("Soft-deleted memory: %s -> %s", target, deleted_path)
+    return jsonify({"ok": True, "renamed_to": deleted_name})
 
 
 if __name__ == "__main__":
