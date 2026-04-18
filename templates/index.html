@@ -890,10 +890,43 @@
     .menu-btn { display: block; }
     .close-sidebar { display: block; }
 
-    nav.view-tabs button { padding: 8px 10px; font-size: 13px; }
-    .content-inner { padding: 12px 14px 40px; }
+    /* Header layout: tight left cluster + scrollable tab strip + refresh.
+       Without overflow-x on nav + flex-shrink on buttons, the 6-tab row
+       spilled off-screen on narrow phones. */
+    header { padding: 0 10px; gap: 8px; overflow-x: hidden; }
+    .brand { font-size: 13px; gap: 6px; flex-shrink: 0; }
+    .live-indicator { display: none; }
+    .spacer { display: none; }
+    nav.view-tabs {
+      flex: 1 1 auto;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      min-width: 0;
+    }
+    nav.view-tabs::-webkit-scrollbar { display: none; }
+    nav.view-tabs button {
+      padding: 8px 10px; font-size: 13px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .header-action { padding: 6px 8px; flex-shrink: 0; }
+
+    /* Give the main content a hard horizontal boundary so child grids can't
+       push the viewport wider than the screen. */
+    main#main { min-width: 0; overflow-x: hidden; }
+    .content-inner { padding: 12px 14px 40px; min-width: 0; }
     .search-bar { padding: 10px 14px; }
     .search-bar label { padding: 0 4px; }
+
+    /* Dashboard totals wrapped, shouldn't fight for the same row as the H2 */
+    .dash-header { flex-direction: column; align-items: flex-start; }
+    .dash-totals { font-size: 12px; gap: 4px 14px; }
+    .card-grid { grid-template-columns: 1fr; }
+    /* Bots/Squad cards collapse to single-column; the 320px minmax pushed
+       the grid wider than the viewport on phones. */
+    .bot-grid { grid-template-columns: 1fr; }
+    .bot-card-file { font-size: 10px; }
 
     .msg-group { padding: 8px; }
     .msg-line .msg-line-ts { display: none; }
@@ -919,7 +952,9 @@
 
   @media (max-width: 400px) {
     nav.view-tabs button { padding: 6px 8px; font-size: 12px; }
-    .brand { font-size: 14px; }
+    .brand-text { display: none; }
+    /* On very narrow screens the word "logger" competes with the tab strip;
+       the brand-dot + live color is enough signal. */
   }
 </style>
 </head>
