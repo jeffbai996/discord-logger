@@ -39,9 +39,9 @@ BOT_BACKUP_DIR = STATE_DIR / "bot_backups"
 SQUAD_BACKUP_DIR = STATE_DIR / "squad_backups"
 PORT = int(os.getenv("UI_PORT", "5050"))
 
-# Squad shared context — files any bot reads on boot. Paths default to fragserv
-# layout; override via SQUAD_DIR for local testing against a fixture tree.
-SQUAD_DIR = Path(os.getenv("SQUAD_DIR", "~/agents/shared/squad-context"))
+# Shared context — files any bot reads on boot. Required env var; no default
+# so misconfiguration fails loud instead of silently writing to the wrong tree.
+SQUAD_DIR = Path(os.getenv("SQUAD_DIR", "~/.local/share/discord-logger/shared")).expanduser()
 SQUAD_MEMORIES_DIR = SQUAD_DIR / "memories"
 SQUAD_CONFIG_FILE = SQUAD_DIR / "squad-config.json"
 MAX_SQUAD_FILE_BYTES = 200 * 1024
@@ -49,47 +49,29 @@ MAX_SQUAD_BACKUPS = 10
 # Memory filename stem: lowercase, digits, underscore, hyphen.
 MEMORY_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
-# Human-readable channel names — keep in sync with summarise_channels.py
-CHANNEL_NAMES = {
-    "1491314655224795147": "cl-2",
-    "1491337341619671111": "cl-1",
-    "1492197457369497822": "cl-3",
-    "1491352842886447214": "private",
-    "1491337758709383279": "claude-channel",
-    "1494449115793457153": "gem",
-}
+# Human-readable channel names + display order are loaded from CHANNELS_CONFIG
+# (a JSON file path in env). See CHANNELS_CONFIG_EXAMPLE.json for shape.
+def _load_channels_config() -> tuple[dict, list]:
+    path = os.getenv("CHANNELS_CONFIG", "")
+    if not path or not os.path.exists(path):
+        return {}, []
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("names", {}), data.get("order", [])
 
-# Display order matches Discord's sidebar order
-CHANNEL_ORDER = [
-    "1491337341619671111",  # cl-1
-    "1491314655224795147",  # cl-2
-    "1492197457369497822",  # cl-3
-    "1494449115793457153",  # gem
-    "1491352842886447214",  # private
-    "1491337758709383279",  # claude-channel (if present)
-]
+CHANNEL_NAMES, CHANNEL_ORDER = _load_channels_config()
 
-# Bots whose persona files are editable from this UI
-BOTS = [
-    {
-        "id": "botA",
-        "label": "Fraggy",
-        "description": "American energy, cl-1 primary",
-        "file": "~/agents/botA/persona.md",
-    },
-    {
-        "id": "botB",
-        "label": "Claudsson",
-        "description": "Norwegian philosopher, cl-3 primary",
-        "file": "~/agents/botB/CLAUDE.md",
-    },
-    {
-        "id": "claudezong",
-        "label": "claude总",
-        "description": "Bilingual warmth, cl-1",
-        "file": "~/.claude-alt/CLAUDE.md",
-    },
-]
+# Bots whose persona files are editable from this UI. Loaded from BOTS_CONFIG
+# (a JSON file path in env). See BOTS_CONFIG_EXAMPLE.json for shape:
+#   [{ "id": "...", "label": "...", "description": "...", "file": "..." }]
+def _load_bots_config() -> list[dict]:
+    path = os.getenv("BOTS_CONFIG", "")
+    if not path or not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return json.load(f)
+
+BOTS = _load_bots_config()
 BOT_BY_ID = {b["id"]: b for b in BOTS}
 MAX_BOT_FILE_BYTES = 200 * 1024  # 200 KB
 MAX_BACKUPS_PER_BOT = 10
@@ -119,7 +101,7 @@ def _ise(where: str, status: int = 500):
     """Log the current exception with context and return a generic JSON error.
 
     We don't surface `str(e)` to clients — exception strings from fs/fcntl ops
-    can leak absolute paths like `~/...`. The traceback still lands
+    can leak absolute paths like the user's home directory. The traceback still lands
     in server logs under `log.exception`.
     """
     log.exception("%s failed", where)

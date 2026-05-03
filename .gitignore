@@ -7,3 +7,11 @@ logs/
 *.db
 .DS_Store
 state/
+
+# Internal architecture plans/specs — kept locally for agent context, never
+# committed. Public repo; these inevitably leak internal infra details.
+docs/superpowers/
+docs/handoff-prompts/
+# Personal channel/bot configs (loaded via CHANNELS_CONFIG / BOTS_CONFIG env vars)
+channels.json
+bots.json

@@ -1,0 +1,15 @@
+[
+  {
+    "_comment": "Each bot whose persona file should be editable from the web UI. Set BOTS_CONFIG=<path-to-this-file> in env.",
+    "id": "agent-1",
+    "label": "Agent One",
+    "description": "Example bot description (visible in UI)",
+    "file": "/path/to/agent-1/persona.md"
+  },
+  {
+    "id": "agent-2",
+    "label": "Agent Two",
+    "description": "Another bot's persona file",
+    "file": "/path/to/agent-2/CLAUDE.md"
+  }
+]

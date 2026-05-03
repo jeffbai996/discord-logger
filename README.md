@@ -1,6 +1,15 @@
 # discord-logger
 
+> **Archived.** This repo is preserved as-is. It works, but I'm no longer
+> developing it. Fork it if you want to extend it.
+
 Lightweight Discord channel logger. Polls channels via the Discord REST API and appends messages to local JSONL files. No database, no bot framework — just flat files you can grep.
+
+Built as a quick-and-dirty tool for personal use. Useful as a reference for:
+- Polling Discord's REST API without the bot/gateway overhead
+- File-locked cron + watch concurrency (`state/poll.lock` via `fcntl`)
+- Adaptive backoff to silence quiet hours
+- A Flask web UI for browsing JSONL logs locally
 
 ## Setup
 
@@ -77,10 +86,23 @@ parameter guarantees no gaps, so the next poll resumes cleanly.
 ## Web UI
 
 The Flask web UI at `ui.py` runs on port 5050 (default) and is meant for
-Tailscale-only access — it has no authentication.
+private-network-only access (e.g. Tailscale or VPN) — it has no authentication.
 
-For local use, `python ui.py` is fine. For the fragserv deployment, prefer
-gunicorn so a stuck request doesn't block the whole UI:
+### Web UI configuration
+
+Set these env vars before launching `ui.py`:
+
+| Var | Purpose |
+| --- | --- |
+| `UI_PORT` | port to bind (default 5050) |
+| `SQUAD_DIR` | directory for shared context files (default `~/.local/share/discord-logger/shared`) |
+| `CHANNELS_CONFIG` | path to a JSON file mapping channel IDs to display labels + order. See `CHANNELS_CONFIG_EXAMPLE.json` |
+| `BOTS_CONFIG` | path to a JSON file listing bot personas editable from the UI. See `BOTS_CONFIG_EXAMPLE.json` |
+
+Without `CHANNELS_CONFIG` or `BOTS_CONFIG`, the UI runs but those panels stay empty.
+
+For local use, `python ui.py` is fine. For a multi-user / always-on
+deployment, prefer gunicorn so a stuck request doesn't block the whole UI:
 
 ```
 gunicorn -w 2 -b 0.0.0.0:5050 --timeout 30 ui:app
@@ -93,8 +115,11 @@ The systemd user unit `discord-logger-ui.service` can use either; switch its
 
 MIT
 
-## Architectural Debt (Todo)
-- **State persistence**: Move from flat files to SQLite for atomic commits and easier querying.
-- **Blocking IO**: Migrate to async so one slow channel doesn't block the poll cycle.
-- **Message lifecycle**: Implement Gateway listeners to capture edits/deletes that REST polling misses.
-- **Log rotation**: Date-based rotation to prevent monolithic files on high-traffic channels.
+## Known limitations (won't fix — repo archived)
+
+- **State persistence is flat files.** SQLite would be cleaner but adds dependencies.
+- **Blocking IO.** One slow channel blocks the poll cycle. Async refactor would fix it.
+- **Message lifecycle.** REST polling misses edits and deletes that don't bump the message ID. A Gateway listener would catch them.
+- **No log rotation.** High-traffic channels grow monolithic files. Date-partitioned files would be the obvious next step.
+
+If you need any of these, fork.

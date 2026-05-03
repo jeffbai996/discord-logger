@@ -1,0 +1,13 @@
+{
+  "_comment": "Map Discord channel IDs to short labels + define display order. Set CHANNELS_CONFIG=<path-to-this-file> in env.",
+  "names": {
+    "111111111111111111": "general",
+    "222222222222222222": "alerts",
+    "333333333333333333": "private"
+  },
+  "order": [
+    "111111111111111111",
+    "222222222222222222",
+    "333333333333333333"
+  ]
+}
